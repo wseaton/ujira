@@ -148,10 +148,10 @@ enum Command {
     Link {
         /// Link type name, e.g. Blocks.
         link_type: Option<String>,
-        /// The inward issue (for Blocks: the blocker).
-        inward: Option<String>,
-        /// The outward issue (for Blocks: the blocked one).
-        outward: Option<String>,
+        /// Source issue that performs the outward relationship (e.g. the blocker for Blocks).
+        source: Option<String>,
+        /// Target issue that receives the relationship (e.g. the blocked issue for Blocks).
+        target: Option<String>,
     },
 
     /// Add labels to an issue without removing existing ones.
@@ -332,14 +332,14 @@ async fn main() -> Result<()> {
         Command::Transition { key, to } => ops::transition(&jira, &key, to.as_deref()).await?,
         Command::Link {
             link_type,
-            inward,
-            outward,
+            source,
+            target,
         } => {
             ops::link(
                 &jira,
                 link_type.as_deref(),
-                inward.as_deref(),
-                outward.as_deref(),
+                source.as_deref(),
+                target.as_deref(),
             )
             .await?
         }
@@ -480,4 +480,21 @@ async fn check(jira: &JiraClient) -> Result<()> {
     let fields = jira.fields().await.context("calling JIRA (auth check)")?;
     println!("auth:    ok ({} fields visible)", fields.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn link_help_names_source_and_target_roles() {
+        let mut command = Cli::command()
+            .find_subcommand("link")
+            .expect("link subcommand")
+            .clone();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("[SOURCE] [TARGET]"), "{help}");
+        assert!(help.contains("performs the outward relationship"), "{help}");
+    }
 }

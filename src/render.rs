@@ -107,15 +107,15 @@ pub fn comments(list: &[Value], max_chars: usize) -> String {
     out
 }
 
-/// `name — inward/outward description` per site link type, for `jira_link_issues`.
+/// Semantic source/target descriptions per site link type, for `jira_link_issues`.
 pub fn link_types(types: &[Value]) -> String {
     let mut out = String::new();
     for t in types {
         out.push_str(&format!(
-            "{} (inward: {}, outward: {})\n",
+            "{} (source -> target: {}; target -> source: {})\n",
             ptr(Some(t), "/name"),
-            ptr(Some(t), "/inward"),
-            ptr(Some(t), "/outward")
+            ptr(Some(t), "/outward"),
+            ptr(Some(t), "/inward")
         ));
     }
     out
@@ -414,6 +414,19 @@ mod tests {
         let out = issue(&rfe(), &cfg(), 4000);
         let (_, desc) = out.split_once("## description\n").expect("a description");
         assert_eq!(desc.trim(), "line one\n\nred bit tail\nline two");
+    }
+
+    #[test]
+    fn link_types_render_semantic_source_and_target_directions() {
+        let types = vec![json!({
+            "name": "Depend",
+            "inward": "is depended on by",
+            "outward": "depends on"
+        })];
+        assert_eq!(
+            link_types(&types),
+            "Depend (source -> target: depends on; target -> source: is depended on by)\n"
+        );
     }
 
     #[test]

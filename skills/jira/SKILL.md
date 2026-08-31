@@ -107,9 +107,11 @@ EOF
 ujira transition PROJ-142
 ujira transition PROJ-142 'In Progress'
 
-# Link. Omit everything to list the site's link types and their direction words.
+# Link SOURCE to TARGET using the type's outward relationship.
+# Omit everything to list the site's link types and their direction words.
 ujira link
 ujira link Blocks PROJ-7 PROJ-142     # PROJ-7 blocks PROJ-142
+ujira link Depend PROJ-7 PROJ-142     # PROJ-7 depends on PROJ-142
 
 # Labels, incrementally — unlike `update --label`, these leave the rest alone.
 ujira add-labels PROJ-142 -l needs-triage -l perf

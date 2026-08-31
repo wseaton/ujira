@@ -160,12 +160,12 @@ pub struct LinkArgs {
     /// Link type name, e.g. `Blocks`, `Relates`. Omit to list the site's link types.
     #[serde(default)]
     pub link_type: Option<String>,
-    /// The issue on the INWARD side (for `Blocks`: the blocker).
-    #[serde(default)]
-    pub inward_key: Option<String>,
-    /// The issue on the OUTWARD side (for `Blocks`: the blocked one).
-    #[serde(default)]
-    pub outward_key: Option<String>,
+    /// Source issue that performs the outward relationship (e.g. the blocker for `Blocks`).
+    #[serde(default, alias = "inward_key")]
+    pub source_key: Option<String>,
+    /// Target issue that receives the relationship (e.g. the blocked issue for `Blocks`).
+    #[serde(default, alias = "outward_key")]
+    pub target_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -376,7 +376,8 @@ impl JiraMcp {
     }
 
     #[tool(
-        description = "Link two issues (inward_key <link_type> outward_key). Omit `link_type` to \
+        description = "Link source_key to target_key using the link type's outward relationship. \
+        For example, Depend with source A and target B means A depends on B. Omit `link_type` to \
         list the site's link types with their direction words."
     )]
     #[tracing::instrument(level = "debug", skip_all)]
@@ -385,8 +386,8 @@ impl JiraMcp {
             ops::link(
                 &self.jira,
                 a.link_type.as_deref(),
-                a.inward_key.as_deref(),
-                a.outward_key.as_deref(),
+                a.source_key.as_deref(),
+                a.target_key.as_deref(),
             )
             .await,
         )
@@ -545,5 +546,26 @@ mod tests {
         );
         assert!(names.contains(&"jira_user_search".to_string()), "{names:?}");
         assert!(names.contains(&"jira_components".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn link_args_accept_semantic_and_legacy_field_names() {
+        let semantic: LinkArgs = serde_json::from_value(serde_json::json!({
+            "link_type": "Depend",
+            "source_key": "PROJ-1",
+            "target_key": "PROJ-2"
+        }))
+        .expect("semantic link arguments");
+        assert_eq!(semantic.source_key.as_deref(), Some("PROJ-1"));
+        assert_eq!(semantic.target_key.as_deref(), Some("PROJ-2"));
+
+        let legacy: LinkArgs = serde_json::from_value(serde_json::json!({
+            "link_type": "Depend",
+            "inward_key": "PROJ-1",
+            "outward_key": "PROJ-2"
+        }))
+        .expect("legacy link arguments");
+        assert_eq!(legacy.source_key.as_deref(), Some("PROJ-1"));
+        assert_eq!(legacy.target_key.as_deref(), Some("PROJ-2"));
     }
 }
