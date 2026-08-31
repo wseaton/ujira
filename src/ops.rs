@@ -215,17 +215,21 @@ pub async fn transition(jira: &JiraClient, key: &str, to: Option<&str>) -> Resul
 pub async fn link(
     jira: &JiraClient,
     link_type: Option<&str>,
-    inward: Option<&str>,
-    outward: Option<&str>,
+    source: Option<&str>,
+    target: Option<&str>,
 ) -> Result<String> {
     let Some(link_type) = link_type else {
         return Ok(render::link_types(&jira.link_types().await?));
     };
-    let (Some(inward), Some(outward)) = (inward, outward) else {
-        bail!("a link type needs both an inward and an outward issue key");
+    let (Some(source), Some(target)) = (source, target) else {
+        bail!("a link type needs both a source and a target issue key");
     };
-    jira.link(link_type, inward, outward).await?;
-    Ok(format!("{inward} {link_type} {outward}"))
+    jira.link(link_type, source, target).await?;
+    Ok(link_confirmation(link_type, source, target))
+}
+
+fn link_confirmation(link_type: &str, source: &str, target: &str) -> String {
+    format!("linked source {source} to target {target} ({link_type})")
 }
 
 /// Add labels without replacing the existing set.
@@ -389,5 +393,13 @@ mod tests {
             .into_map()
             .expect("empty is fine here");
         assert!(m.is_empty(), "the guard lives in update_issue, on this map");
+    }
+
+    #[test]
+    fn link_confirmation_names_the_semantic_roles() {
+        assert_eq!(
+            link_confirmation("Depend", "PROJ-1", "PROJ-2"),
+            "linked source PROJ-1 to target PROJ-2 (Depend)"
+        );
     }
 }

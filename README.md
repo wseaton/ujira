@@ -98,7 +98,7 @@ Enforced in the client, beneath every operation, so a level cannot be widened by
 | `create -p KEY -t TYPE -s TEXT [-d TEXT\|-] [--parent KEY] [-l LABEL]… [--fields JSON]` | create |
 | `update <KEY> [-s TEXT] [-d TEXT\|-] [-l LABEL]… [--fields JSON]` | edit in place |
 | `transition <KEY> [TO]` | move status; omit `TO` to list what is reachable |
-| `link [TYPE] [INWARD] [OUTWARD]` | link two issues; omit all to list link types |
+| `link [TYPE] [SOURCE] [TARGET]` | link source to target using the type's outward relationship; omit all to list link types |
 | `add-labels <KEY> -l LABEL…` | append labels, leaving the rest alone |
 | `remove-labels <KEY> -l LABEL…` | remove specific labels |
 | `attach <KEY> <FILE> [--filename NAME] [--json]` | upload a file attachment |
@@ -120,6 +120,17 @@ links survive.
 
 Errors exit non-zero. Over MCP the same errors return as a readable line, since a tool error is data
 the model acts on.
+
+For directional links, `SOURCE` is the issue performing the relationship and `TARGET` is the issue
+receiving it:
+
+```bash
+ujira link Blocks PROJ-7 PROJ-142  # PROJ-7 blocks PROJ-142
+ujira link Depend PROJ-7 PROJ-142  # PROJ-7 depends on PROJ-142
+```
+
+The `inwardIssue` and `outwardIssue` names used by Jira's REST API are intentionally not exposed as
+semantic roles because their direction is counterintuitive.
 
 ### MCP tools
 

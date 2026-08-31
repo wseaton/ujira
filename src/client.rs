@@ -239,17 +239,16 @@ impl JiraClient {
         Ok(())
     }
 
-    /// Link two issues: `inward` <-link type-> `outward` (e.g. Blocks: inward blocks outward).
+    /// Link `source` to `target` using the link type's outward description.
+    ///
+    /// Jira's wire-format names are counterintuitive: the source belongs in `inwardIssue`, while
+    /// the target belongs in `outwardIssue`. For example, `Depend, A, B` means `A depends on B`.
     #[tracing::instrument(level = "debug", skip(self), err)]
-    pub async fn link(&self, link_type: &str, inward: &str, outward: &str) -> Result<()> {
+    pub async fn link(&self, link_type: &str, source: &str, target: &str) -> Result<()> {
         self.require(Access::ReadWrite)?;
         self.send(
             self.req(reqwest::Method::POST, "/rest/api/2/issueLink")
-                .json(&json!({
-                    "type": {"name": link_type},
-                    "inwardIssue": {"key": inward},
-                    "outwardIssue": {"key": outward},
-                })),
+                .json(&issue_link_body(link_type, source, target)),
             "link",
         )
         .await?;
@@ -420,6 +419,14 @@ fn str_at<'a>(v: &'a Value, ptr: &str) -> &'a str {
     v.pointer(ptr).and_then(Value::as_str).unwrap_or_default()
 }
 
+fn issue_link_body(link_type: &str, source: &str, target: &str) -> Value {
+    json!({
+        "type": {"name": link_type},
+        "inwardIssue": {"key": source},
+        "outwardIssue": {"key": target},
+    })
+}
+
 /// Best-effort MIME type from a filename extension. Falls back to application/octet-stream.
 fn mime_from_filename(name: &str) -> String {
     match name
@@ -470,5 +477,12 @@ mod tests {
         assert_eq!(id_of(&json!({"id": "10001"})), "10001");
         assert_eq!(id_of(&json!({"id": 10001})), "10001");
         assert_eq!(id_of(&json!({})), "");
+    }
+
+    #[test]
+    fn link_source_maps_to_jiras_inward_issue_field() {
+        let body = issue_link_body("Depend", "PROJ-1", "PROJ-2");
+        assert_eq!(body["inwardIssue"]["key"], "PROJ-1");
+        assert_eq!(body["outwardIssue"]["key"], "PROJ-2");
     }
 }
