@@ -1,6 +1,6 @@
 //! The shared operations, once.
 //!
-//! Both front ends are thin over this module: [`crate::server`] wraps each one in an MCP tool, and
+//! Both front ends are thin over this module: `crate::server` wraps each one in an MCP tool, and
 //! the CLI wraps each in a subcommand. Neither owns any logic — an agent scripting `ujira search`
 //! in a shell and an agent calling `jira_search` over MCP must get byte-identical output, or the
 //! skill that teaches one is lying about the other.
@@ -17,7 +17,8 @@ use serde_json::{Map, Value, json};
 
 /// Whether description/comment prose is plain text (api/v2) or markdown that should be converted to
 /// ADF (api/v3). The default is plain text, preserving the existing behavior.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum ProseFormat {
     /// Send as-is via api/v2 (plain text / wiki markup).
     #[default]

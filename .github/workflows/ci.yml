@@ -24,3 +24,7 @@ jobs:
       # Every test is offline: no JIRA credentials exist in CI, and none should.
       - name: test
         run: cargo test
+      - name: clippy (library only)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: test (library only)
+        run: cargo test --no-default-features

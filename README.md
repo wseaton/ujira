@@ -84,6 +84,10 @@ Checked inside the client before every mutating request, so no tool can widen it
 
 ## Library
 
+`ujira = { git = "https://github.com/wseaton/ujira", default-features = false }` builds only the
+client, typed models, and renderers, without the MCP server, CLI, or keychain dependencies (features
+`mcp`, `cli`, `keychain`; `cli` is the default and implies the other two).
+
 ```rust
 use ujira::{Access, Config, JiraClient, fields::field_text};
 

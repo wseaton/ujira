@@ -211,11 +211,17 @@ fn resolve_token(file: &File, defaults: &File, account: &str) -> Result<(String,
         .or(defaults.keychain)
         .unwrap_or(true);
     if use_keychain {
+        #[cfg(feature = "keychain")]
         match crate::keychain::get(account) {
             Some(t) if !t.trim().is_empty() => return Ok((t, TokenSource::Keychain)),
             Some(_) => tracing::debug!(account, "keychain entry is empty, trying the next source"),
             None => tracing::debug!(account, "no keychain entry, trying the next source"),
         }
+        #[cfg(not(feature = "keychain"))]
+        tracing::debug!(
+            account,
+            "built without the keychain feature, trying the next source"
+        );
     }
     let path = env("JIRA_API_TOKEN_FILE")
         .or_else(|| file.token_file.clone())
