@@ -36,7 +36,7 @@ variables and `jira-mcp/config.toml` are still read.
 | Key | Env | |
 | --- | --- | --- |
 | `url` | `JIRA_URL` | Site URL (falls back to a jira-cli config's `server:`) |
-| `username` | `JIRA_USERNAME` | Account email (falls back to jira-cli's `login:`) |
+| `username` | `JIRA_USERNAME`, else `JIRA_EMAIL` | Account email (falls back to jira-cli's `login:`) |
 | `access` | `UJIRA_ACCESS` | `read-only`, `read-comment`, or `read-write` (default) |
 | `keychain` | `UJIRA_KEYCHAIN` | Use the OS keychain (default true) |
 | `token_file` | `JIRA_API_TOKEN_FILE` | Default `~/.jiratoken` |
