@@ -10,13 +10,17 @@
 //!   [`crate::adf`] builds the ADF and `/rest/api/3/…` carries it. Reads stay on api/2.
 
 use crate::config::{Access, Config};
-use anyhow::{Context, Result, bail};
+use crate::fields::{FieldIndex, values_by_name};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// A connected JIRA Cloud client. Cheap to share behind an `Arc`.
 pub struct JiraClient {
     cfg: Config,
     http: reqwest::Client,
+    field_index: OnceLock<FieldIndex>,
 }
 
 /// The compact fields a search row carries (enough to triage; `get_issue` for detail).
@@ -27,6 +31,7 @@ impl JiraClient {
         Self {
             cfg,
             http: reqwest::Client::new(),
+            field_index: OnceLock::new(),
         }
     }
 
@@ -40,9 +45,24 @@ impl JiraClient {
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.http
-            .request(method, format!("{}{path}", self.cfg.base))
-            .basic_auth(&self.cfg.email, Some(&self.cfg.token))
+        self.authed(
+            self.http
+                .request(method, format!("{}{path}", self.cfg.base)),
+        )
+    }
+
+    /// Like [`Self::req`], but each segment is percent-encoded, for paths that carry caller strings.
+    fn req_segments(
+        &self,
+        method: reqwest::Method,
+        segments: &[&str],
+    ) -> Result<reqwest::RequestBuilder> {
+        let url = segment_url(&self.cfg.base, segments)?;
+        Ok(self.authed(self.http.request(method, url)))
+    }
+
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.basic_auth(&self.cfg.email, Some(&self.cfg.token))
             .header("Accept", "application/json")
     }
 
@@ -75,6 +95,34 @@ impl JiraClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// JQL search over every page, with the caller's `fields`. Returns up to `max_results` raw
+    /// issue objects. Fails when Jira breaks the paging contract (a missing or repeated
+    /// `nextPageToken`, or an `issues` value that is not an array of objects).
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn search_all(
+        &self,
+        jql: &str,
+        fields: &[&str],
+        max_results: u32,
+    ) -> Result<Vec<Value>> {
+        let mut pages = SearchPages::new(max_results);
+        while let Some(page) = pages.next_request() {
+            let mut body = json!({"jql": jql, "fields": fields, "maxResults": page.size});
+            if let Some(token) = page.token {
+                body["nextPageToken"] = Value::String(token);
+            }
+            let v = self
+                .send(
+                    self.req(reqwest::Method::POST, "/rest/api/3/search/jql")
+                        .json(&body),
+                    "search_all",
+                )
+                .await?;
+            pages.accept(v)?;
+        }
+        Ok(pages.into_issues())
     }
 
     /// One issue, plus its links and (optionally) its comments. `/rest/api/2` for plain-text prose.
@@ -347,6 +395,77 @@ impl JiraClient {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
+    /// An issue entity property's value, or `None` when Jira answers 404 (no such property, or no
+    /// issue the account can see).
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn get_issue_property(&self, key: &str, property_key: &str) -> Result<Option<Value>> {
+        let req = self.req_segments(
+            reqwest::Method::GET,
+            &["rest", "api", "3", "issue", key, "properties", property_key],
+        )?;
+        self.send_or_missing(req, "get_issue_property")
+            .await?
+            .map(property_value)
+            .transpose()
+    }
+
+    /// Create or replace an issue entity property. `value` is stored verbatim as the property.
+    #[tracing::instrument(level = "debug", skip(self, value), err)]
+    pub async fn set_issue_property(
+        &self,
+        key: &str,
+        property_key: &str,
+        value: &Value,
+    ) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        let req = self.req_segments(
+            reqwest::Method::PUT,
+            &["rest", "api", "3", "issue", key, "properties", property_key],
+        )?;
+        self.send(req.json(value), "set_issue_property").await?;
+        Ok(())
+    }
+
+    /// Read fields of one issue by display name (e.g. `"Embargo Status"`), as name -> raw field
+    /// value (`null` when the issue has no value). Names resolve against `/rest/api/3/field`,
+    /// fetched once per client. A name that matches no field, or more than one, fails the whole
+    /// call with a [`crate::fields::FieldResolutionError`] listing every such name.
+    /// [`crate::fields::field_text`] reduces each value to its display text.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn get_fields_by_name(
+        &self,
+        key: &str,
+        names: &[&str],
+    ) -> Result<Map<String, Value>> {
+        if names.is_empty() {
+            return Ok(Map::new());
+        }
+        let resolved = self.field_index().await?.resolve(names)?;
+        let ids: Vec<&str> = resolved.iter().map(|(_, id)| id.as_str()).collect();
+        let issue = self
+            .send(
+                self.req_segments(reqwest::Method::GET, &["rest", "api", "3", "issue", key])?
+                    .query(&[("fields", ids.join(","))]),
+                "get_fields_by_name",
+            )
+            .await?;
+        values_by_name(&issue, &resolved)
+    }
+
+    async fn field_index(&self) -> Result<&FieldIndex> {
+        if let Some(index) = self.field_index.get() {
+            return Ok(index);
+        }
+        let v = self
+            .send(
+                self.req(reqwest::Method::GET, "/rest/api/3/field"),
+                "field_index",
+            )
+            .await?;
+        let index = FieldIndex::from_metadata(&v)?;
+        Ok(self.field_index.get_or_init(|| index))
+    }
+
     /// Users matching an email, username, or display name. Raw user objects.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn user_search(&self, query: &str, limit: u32) -> Result<Vec<Value>> {
@@ -381,6 +500,25 @@ impl JiraClient {
     /// Send, then map a non-2xx to an error carrying the (truncated) body. A 204/empty body becomes
     /// `null` rather than a parse error, which is what the write endpoints return.
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<Value> {
+        let (status, text) = self.exchange(req, what).await?;
+        decode(what, status, &text)
+    }
+
+    /// [`Self::send`], except a 404 is `None` instead of an error.
+    async fn send_or_missing(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<Option<Value>> {
+        let (status, text) = self.exchange(req, what).await?;
+        missing_as_none(what, status, &text)
+    }
+
+    async fn exchange(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<(reqwest::StatusCode, String)> {
         let req = req
             .build()
             .with_context(|| format!("building the jira {what} request"))?;
@@ -392,17 +530,130 @@ impl JiraClient {
             .with_context(|| format!("jira {what} request"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            tracing::debug!(what, %status, bytes = text.len(), "jira response");
-        } else {
-            tracing::warn!(what, %status, body = %truncate(&text, 400), "jira request failed");
-            bail!("jira {what} failed ({status}): {}", truncate(&text, 400));
+        Ok((status, text))
+    }
+}
+
+/// A response's status and body as a JSON value: non-2xx is an error, an empty body is `null`.
+fn decode(what: &str, status: reqwest::StatusCode, text: &str) -> Result<Value> {
+    if status.is_success() {
+        tracing::debug!(what, %status, bytes = text.len(), "jira response");
+    } else {
+        tracing::warn!(what, %status, body = %truncate(text, 400), "jira request failed");
+        bail!("jira {what} failed ({status}): {}", truncate(text, 400));
+    }
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(text)
+        .with_context(|| format!("parsing jira {what} response: {}", truncate(text, 200)))
+}
+
+/// [`decode`], with a 404 read as absence.
+fn missing_as_none(what: &str, status: reqwest::StatusCode, text: &str) -> Result<Option<Value>> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        tracing::debug!(what, %status, "jira resource absent");
+        return Ok(None);
+    }
+    decode(what, status, text).map(Some)
+}
+
+/// `base` with `segments` appended, each percent-encoded as a single path segment.
+fn segment_url(base: &str, segments: &[&str]) -> Result<reqwest::Url> {
+    let mut url =
+        reqwest::Url::parse(base).with_context(|| format!("parsing the jira base url {base}"))?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("the jira base url {base} cannot carry a path"))?
+        .pop_if_empty()
+        .extend(segments);
+    Ok(url)
+}
+
+/// The `value` of an issue property response (`{"key": .., "value": ..}`).
+fn property_value(body: Value) -> Result<Value> {
+    match body {
+        Value::Object(mut o) => o
+            .remove("value")
+            .context("jira issue property response has no value"),
+        other => bail!(
+            "jira issue property response is not an object: {}",
+            truncate(&other.to_string(), 200)
+        ),
+    }
+}
+
+/// The largest page [`JiraClient::search_all`] asks for.
+const SEARCH_PAGE_SIZE: u32 = 50;
+
+/// The next `search/jql` request [`SearchPages`] wants made.
+#[derive(Debug, PartialEq, Eq)]
+struct PageRequest {
+    size: u32,
+    token: Option<String>,
+}
+
+/// Token-paging state for `search/jql`: which page to ask for next, and what came back so far.
+struct SearchPages {
+    max: usize,
+    issues: Vec<Value>,
+    token: Option<String>,
+    seen: HashSet<String>,
+    done: bool,
+}
+
+impl SearchPages {
+    fn new(max_results: u32) -> Self {
+        Self {
+            max: max_results as usize,
+            issues: Vec::new(),
+            token: None,
+            seen: HashSet::new(),
+            done: false,
         }
-        if text.trim().is_empty() {
-            return Ok(Value::Null);
+    }
+
+    /// The next page to fetch, or `None` once the last page or `max_results` is reached.
+    fn next_request(&self) -> Option<PageRequest> {
+        let remaining = self.max.saturating_sub(self.issues.len());
+        if self.done || remaining == 0 {
+            return None;
         }
-        serde_json::from_str(&text)
-            .with_context(|| format!("parsing jira {what} response: {}", truncate(&text, 200)))
+        let size = u32::try_from(remaining).map_or(SEARCH_PAGE_SIZE, |r| r.min(SEARCH_PAGE_SIZE));
+        Some(PageRequest {
+            size,
+            token: self.token.clone(),
+        })
+    }
+
+    /// Take one `search/jql` response body.
+    fn accept(&mut self, page: Value) -> Result<()> {
+        let Some(issues) = page.get("issues").and_then(Value::as_array) else {
+            bail!("jira search returned no issues array");
+        };
+        if let Some(i) = issues.iter().position(|issue| !issue.is_object()) {
+            bail!("jira search returned a non-object issue at index {i}");
+        }
+        let room = self.max.saturating_sub(self.issues.len());
+        self.issues.extend(issues.iter().take(room).cloned());
+        if page.get("isLast").and_then(Value::as_bool) == Some(true)
+            || self.issues.len() >= self.max
+        {
+            self.done = true;
+            return Ok(());
+        }
+        let token = match page.get("nextPageToken").and_then(Value::as_str) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => bail!("jira search omitted nextPageToken on a page that is not the last"),
+        };
+        if !self.seen.insert(token.clone()) {
+            bail!("jira search repeated nextPageToken {token}");
+        }
+        self.token = Some(token);
+        Ok(())
+    }
+
+    fn into_issues(self) -> Vec<Value> {
+        self.issues
     }
 }
 
@@ -464,7 +715,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::client::*;
 
     #[test]
     fn truncate_is_char_safe() {
@@ -484,5 +735,251 @@ mod tests {
         let body = issue_link_body("Depend", "PROJ-1", "PROJ-2");
         assert_eq!(body["inwardIssue"]["key"], "PROJ-1");
         assert_eq!(body["outwardIssue"]["key"], "PROJ-2");
+    }
+
+    fn issues(range: std::ops::Range<u32>) -> Vec<Value> {
+        range.map(|n| json!({"key": format!("P-{n}")})).collect()
+    }
+
+    fn keys(issues: &[Value]) -> Vec<&str> {
+        issues.iter().map(|i| str_at(i, "/key")).collect()
+    }
+
+    #[test]
+    fn search_pages_walks_tokens_until_is_last() {
+        let mut p = SearchPages::new(500);
+        assert_eq!(
+            p.next_request(),
+            Some(PageRequest {
+                size: 50,
+                token: None
+            })
+        );
+        p.accept(json!({"issues": issues(0..50), "nextPageToken": "t1", "isLast": false}))
+            .unwrap();
+        assert_eq!(
+            p.next_request(),
+            Some(PageRequest {
+                size: 50,
+                token: Some("t1".into())
+            })
+        );
+        p.accept(json!({"issues": issues(50..60), "isLast": true}))
+            .unwrap();
+        assert_eq!(p.next_request(), None);
+        let all = p.into_issues();
+        assert_eq!(all.len(), 60);
+        assert_eq!(keys(&all)[59], "P-59");
+    }
+
+    #[test]
+    fn search_pages_shrinks_the_last_page_to_the_remaining_budget() {
+        let mut p = SearchPages::new(70);
+        assert_eq!(p.next_request().map(|r| r.size), Some(50));
+        p.accept(json!({"issues": issues(0..50), "nextPageToken": "t1"}))
+            .unwrap();
+        assert_eq!(p.next_request().map(|r| r.size), Some(20));
+        p.accept(json!({"issues": issues(50..70), "nextPageToken": "t2"}))
+            .unwrap();
+        assert_eq!(p.next_request(), None);
+        assert_eq!(p.into_issues().len(), 70);
+    }
+
+    #[test]
+    fn search_pages_stops_at_max_without_needing_a_token() {
+        let mut p = SearchPages::new(3);
+        assert_eq!(p.next_request().map(|r| r.size), Some(3));
+        p.accept(json!({"issues": issues(0..3), "isLast": false}))
+            .unwrap();
+        assert_eq!(p.next_request(), None);
+        assert_eq!(keys(&p.into_issues()), ["P-0", "P-1", "P-2"]);
+    }
+
+    #[test]
+    fn search_pages_never_returns_more_than_max() {
+        let mut p = SearchPages::new(2);
+        p.accept(json!({"issues": issues(0..5), "nextPageToken": "t1"}))
+            .unwrap();
+        assert_eq!(p.next_request(), None);
+        assert_eq!(keys(&p.into_issues()), ["P-0", "P-1"]);
+    }
+
+    #[test]
+    fn search_pages_with_zero_max_asks_for_nothing() {
+        let p = SearchPages::new(0);
+        assert_eq!(p.next_request(), None);
+        assert!(p.into_issues().is_empty());
+    }
+
+    #[test]
+    fn search_pages_accepts_an_empty_last_page() {
+        let mut p = SearchPages::new(10);
+        p.accept(json!({"issues": [], "isLast": true})).unwrap();
+        assert_eq!(p.next_request(), None);
+        assert!(p.into_issues().is_empty());
+    }
+
+    #[test]
+    fn search_pages_fails_when_a_non_last_page_omits_its_token() {
+        for page in [
+            json!({"issues": issues(0..50), "isLast": false}),
+            json!({"issues": issues(0..50)}),
+            json!({"issues": issues(0..50), "nextPageToken": ""}),
+            json!({"issues": issues(0..50), "nextPageToken": null}),
+            json!({"issues": issues(0..50), "nextPageToken": 7}),
+            json!({"issues": issues(0..50), "isLast": "true", "nextPageToken": null}),
+        ] {
+            let mut p = SearchPages::new(500);
+            let err = p.accept(page.clone()).unwrap_err().to_string();
+            assert!(err.contains("omitted nextPageToken"), "{page}: {err}");
+        }
+    }
+
+    #[test]
+    fn search_pages_fails_when_a_token_repeats() {
+        let mut p = SearchPages::new(500);
+        p.accept(json!({"issues": issues(0..50), "nextPageToken": "t1"}))
+            .unwrap();
+        p.accept(json!({"issues": issues(50..100), "nextPageToken": "t2"}))
+            .unwrap();
+        let err = p
+            .accept(json!({"issues": issues(100..150), "nextPageToken": "t1"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repeated nextPageToken t1"), "{err}");
+    }
+
+    #[test]
+    fn search_pages_fails_when_issues_is_not_an_array() {
+        for page in [
+            json!({"isLast": true}),
+            json!({"issues": null, "isLast": true}),
+            json!({"issues": {"key": "P-1"}, "isLast": true}),
+            json!([]),
+            Value::Null,
+        ] {
+            let mut p = SearchPages::new(10);
+            let err = p.accept(page.clone()).unwrap_err().to_string();
+            assert!(err.contains("no issues array"), "{page}: {err}");
+        }
+    }
+
+    #[test]
+    fn search_pages_fails_on_a_non_object_issue() {
+        let mut p = SearchPages::new(10);
+        let err = p
+            .accept(json!({"issues": [{"key": "P-1"}, "P-2"], "isLast": true}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-object issue at index 1"), "{err}");
+    }
+
+    #[test]
+    fn decode_maps_status_and_body() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            decode("x", StatusCode::OK, r#"{"a":1}"#).unwrap(),
+            json!({"a": 1})
+        );
+        assert_eq!(
+            decode("x", StatusCode::NO_CONTENT, "").unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            decode("x", StatusCode::CREATED, "  \n").unwrap(),
+            Value::Null
+        );
+        let err = decode("x", StatusCode::BAD_REQUEST, "nope")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("jira x failed (400 Bad Request): nope"),
+            "{err}"
+        );
+        let err = decode("x", StatusCode::NOT_FOUND, "gone")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("404"), "{err}");
+        assert!(decode("x", StatusCode::OK, "{not json").is_err());
+    }
+
+    #[test]
+    fn missing_as_none_reads_only_404_as_absent() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            missing_as_none("x", StatusCode::NOT_FOUND, r#"{"errorMessages":["no"]}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            missing_as_none("x", StatusCode::OK, r#"{"value":{}}"#).unwrap(),
+            Some(json!({"value": {}}))
+        );
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::GONE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(missing_as_none("x", status, "").is_err(), "{status}");
+        }
+    }
+
+    #[test]
+    fn property_value_returns_the_stored_value() {
+        assert_eq!(
+            property_value(json!({"key": "verdict", "value": {"ok": true}})).unwrap(),
+            json!({"ok": true})
+        );
+        assert_eq!(
+            property_value(json!({"key": "n", "value": 3})).unwrap(),
+            json!(3)
+        );
+        assert_eq!(
+            property_value(json!({"key": "n", "value": null})).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn property_value_rejects_a_malformed_body() {
+        let err = property_value(json!({"key": "verdict"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no value"), "{err}");
+        let err = property_value(Value::Null).unwrap_err().to_string();
+        assert!(err.contains("not an object"), "{err}");
+    }
+
+    #[test]
+    fn segment_url_encodes_each_segment() {
+        let url = segment_url(
+            "https://site.atlassian.net",
+            &[
+                "rest",
+                "api",
+                "3",
+                "issue",
+                "P-1",
+                "properties",
+                "a/b c?d#e",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://site.atlassian.net/rest/api/3/issue/P-1/properties/a%2Fb%20c%3Fd%23e"
+        );
+    }
+
+    #[test]
+    fn segment_url_keeps_a_base_path() {
+        let url = segment_url("https://host/jira", &["rest", "api", "3", "field"]).unwrap();
+        assert_eq!(url.as_str(), "https://host/jira/rest/api/3/field");
+    }
+
+    #[test]
+    fn segment_url_rejects_a_bad_base() {
+        assert!(segment_url("not a url", &["rest"]).is_err());
+        assert!(segment_url("mailto:me@example.com", &["rest"]).is_err());
     }
 }
