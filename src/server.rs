@@ -8,7 +8,7 @@ use crate::client::JiraClient;
 use crate::ops::{self, IssueFields};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::Value;
@@ -494,8 +494,8 @@ impl ServerHandler for JiraMcp {
     /// Advertise the `tools` capability during `initialize`. Without it a spec-compliant client
     /// (Claude Code) connects, sees no tools capability, and never calls `tools/list` — the server
     /// looks connected but exposes nothing.
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "JIRA Cloud. Read tools return compact text; pass format=\"json\" for raw payloads.",
         )
     }
