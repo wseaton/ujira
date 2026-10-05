@@ -11,7 +11,7 @@
 
 use crate::config::{Access, Config};
 use crate::fields::{FieldIndex, values_by_name};
-use crate::model::{ChangelogEntry, Comment, parse_items};
+use crate::model::{ChangelogEntry, Comment, Transition, parse_items, parse_transitions};
 use crate::paging::{OffsetPages, SearchPages};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
@@ -323,6 +323,47 @@ impl JiraClient {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// The transitions available from the issue's current status, with each one's screen fields
+    /// (`expand=transitions.fields`), so a caller can see which fields a transition requires.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn transitions_with_fields(&self, key: &str) -> Result<Vec<Transition>> {
+        let v = self
+            .send(
+                self.req_segments(
+                    reqwest::Method::GET,
+                    &["rest", "api", "3", "issue", key, "transitions"],
+                )?
+                .query(&[("expand", "transitions.fields")]),
+                "transitions_with_fields",
+            )
+            .await?;
+        parse_transitions(v)
+    }
+
+    /// Drive a transition by id, setting screen `fields` (e.g. `resolution`) and applying `update`
+    /// operations in the same request. api/v3, so rich-text values must be ADF. Empty maps are
+    /// left out of the request.
+    #[tracing::instrument(level = "debug", skip(self, fields, update), err)]
+    pub async fn transition_with_fields(
+        &self,
+        key: &str,
+        id: &str,
+        fields: Map<String, Value>,
+        update: Map<String, Value>,
+    ) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        self.send(
+            self.req_segments(
+                reqwest::Method::POST,
+                &["rest", "api", "3", "issue", key, "transitions"],
+            )?
+            .json(&transition_body(id, fields, update)),
+            "transition_with_fields",
+        )
+        .await?;
+        Ok(())
     }
 
     /// Drive a transition by id (resolve the name first with [`Self::transitions`]).
@@ -675,6 +716,19 @@ fn str_at<'a>(v: &'a Value, ptr: &str) -> &'a str {
     v.pointer(ptr).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// A transitions POST body; `fields` and `update` only when non-empty.
+fn transition_body(id: &str, fields: Map<String, Value>, update: Map<String, Value>) -> Value {
+    let mut body = Map::new();
+    body.insert("transition".into(), json!({ "id": id }));
+    if !fields.is_empty() {
+        body.insert("fields".into(), Value::Object(fields));
+    }
+    if !update.is_empty() {
+        body.insert("update".into(), Value::Object(update));
+    }
+    Value::Object(body)
+}
+
 fn issue_link_body(link_type: &str, source: &str, target: &str) -> Value {
     json!({
         "type": {"name": link_type},
@@ -849,5 +903,51 @@ mod tests {
     fn segment_url_rejects_a_bad_base() {
         assert!(segment_url("not a url", &["rest"]).is_err());
         assert!(segment_url("mailto:me@example.com", &["rest"]).is_err());
+    }
+
+    fn object(v: Value) -> Map<String, Value> {
+        match v {
+            Value::Object(o) => o,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    #[test]
+    fn transition_body_carries_only_what_is_set() {
+        assert_eq!(
+            transition_body("11", Map::new(), Map::new()),
+            json!({"transition": {"id": "11"}})
+        );
+        assert_eq!(
+            transition_body(
+                "61",
+                object(json!({
+                    "resolution": {"name": "Done"},
+                    "customfield_10500": {"value": "Yes"},
+                })),
+                Map::new(),
+            ),
+            json!({
+                "transition": {"id": "61"},
+                "fields": {"resolution": {"name": "Done"}, "customfield_10500": {"value": "Yes"}},
+            })
+        );
+        let update = json!({"labels": [{"add": "closed-by-bot"}]});
+        assert_eq!(
+            transition_body("61", Map::new(), object(update.clone())),
+            json!({"transition": {"id": "61"}, "update": update})
+        );
+        assert_eq!(
+            transition_body(
+                "61",
+                object(json!({"resolution": {"name": "Done"}})),
+                object(update.clone())
+            ),
+            json!({
+                "transition": {"id": "61"},
+                "fields": {"resolution": {"name": "Done"}},
+                "update": update,
+            })
+        );
     }
 }

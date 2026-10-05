@@ -1,10 +1,11 @@
 //! Typed views of the Jira payloads [`crate::JiraClient`] parses for callers. Timestamps stay as
 //! Jira's strings (e.g. `2026-10-04T12:00:00.000+0000`); unknown keys are ignored.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// A Jira account, as on comment and changelog authors and from `/myself`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -51,6 +52,56 @@ pub struct Comment {
     pub updated: Option<String>,
 }
 
+/// A transition available from an issue's current status, with its screen fields.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transition {
+    pub id: String,
+    pub name: String,
+    /// The status the transition leads to.
+    pub to: Option<TransitionTarget>,
+    #[serde(default)]
+    pub has_screen: bool,
+    /// Field id -> field metadata, from `expand=transitions.fields`.
+    #[serde(default)]
+    pub fields: BTreeMap<String, TransitionField>,
+}
+
+impl Transition {
+    /// Ids of the fields this transition requires.
+    pub fn required_fields(&self) -> impl Iterator<Item = &str> {
+        self.fields
+            .iter()
+            .filter(|(_, f)| f.required)
+            .map(|(id, _)| id.as_str())
+    }
+}
+
+/// The status a [`Transition`] leads to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TransitionTarget {
+    pub id: String,
+    pub name: String,
+}
+
+/// A field on a transition's screen.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionField {
+    pub required: bool,
+    pub name: String,
+    pub key: Option<String>,
+    #[serde(default)]
+    pub schema: Value,
+    /// Legal values for option-like fields (resolution, selects), raw.
+    #[serde(default)]
+    pub allowed_values: Vec<Value>,
+    #[serde(default)]
+    pub has_default_value: bool,
+    #[serde(default)]
+    pub operations: Vec<String>,
+}
+
 /// Deserialize a list of raw items into `T`, naming the first item that does not fit.
 pub(crate) fn parse_items<T: DeserializeOwned>(what: &str, items: Vec<Value>) -> Result<Vec<T>> {
     items
@@ -60,6 +111,17 @@ pub(crate) fn parse_items<T: DeserializeOwned>(what: &str, items: Vec<Value>) ->
             serde_json::from_value(item).with_context(|| format!("parsing jira {what} item {i}"))
         })
         .collect()
+}
+
+/// The `transitions` array of a transitions response.
+pub(crate) fn parse_transitions(body: Value) -> Result<Vec<Transition>> {
+    let Value::Object(mut o) = body else {
+        bail!("jira transitions response is not an object");
+    };
+    let Some(Value::Array(items)) = o.remove("transitions") else {
+        bail!("jira transitions response has no transitions array");
+    };
+    parse_items("transition", items)
 }
 
 #[cfg(test)]
@@ -143,5 +205,65 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.to_string(), "parsing jira user item 1");
+    }
+
+    #[test]
+    fn transitions_parse_with_screen_fields() {
+        let ts = parse_transitions(json!({
+            "expand": "transitions",
+            "transitions": [
+                {
+                    "id": "61", "name": "Close", "hasScreen": true,
+                    "to": {"id": "6", "name": "Closed", "self": "x"},
+                    "fields": {
+                        "resolution": {
+                            "required": true, "name": "Resolution", "key": "resolution",
+                            "schema": {"type": "resolution", "system": "resolution"},
+                            "operations": ["set"], "hasDefaultValue": false,
+                            "allowedValues": [{"id": "10000", "name": "Done"}, {"id": "10001", "name": "Won't Do"}],
+                        },
+                        "customfield_10500": {
+                            "required": false, "name": "Affects Testing",
+                            "schema": {"type": "option", "custom": "x", "customId": 10500},
+                            "operations": ["set"],
+                        },
+                    },
+                },
+                {"id": "11", "name": "Start", "to": {"id": "3", "name": "In Progress"}},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(ts.len(), 2);
+        let close = &ts[0];
+        assert_eq!((close.id.as_str(), close.name.as_str()), ("61", "Close"));
+        assert!(close.has_screen);
+        assert_eq!(
+            close.to,
+            Some(TransitionTarget {
+                id: "6".into(),
+                name: "Closed".into()
+            })
+        );
+        assert_eq!(close.required_fields().collect::<Vec<_>>(), ["resolution"]);
+        let resolution = &close.fields["resolution"];
+        assert_eq!(resolution.allowed_values.len(), 2);
+        assert_eq!(resolution.operations, ["set"]);
+        assert!(close.fields["customfield_10500"].allowed_values.is_empty());
+        assert!(!ts[1].has_screen);
+        assert!(ts[1].fields.is_empty());
+        assert_eq!(ts[1].required_fields().count(), 0);
+    }
+
+    #[test]
+    fn transitions_reject_a_malformed_response() {
+        for (v, want) in [
+            (json!([]), "not an object"),
+            (json!({}), "no transitions array"),
+            (json!({"transitions": {}}), "no transitions array"),
+            (json!({"transitions": [{"name": "x"}]}), "transition item 0"),
+        ] {
+            let err = parse_transitions(v.clone()).unwrap_err().to_string();
+            assert!(err.contains(want), "{v}: {err}");
+        }
     }
 }
