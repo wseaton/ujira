@@ -10,7 +10,7 @@
 //!   [`crate::adf`] builds the ADF and `/rest/api/3/…` carries it. Reads stay on api/2.
 
 use crate::config::{Access, Config};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 
@@ -41,9 +41,24 @@ impl JiraClient {
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.http
-            .request(method, format!("{}{path}", self.cfg.base))
-            .basic_auth(&self.cfg.email, Some(&self.cfg.token))
+        self.authed(
+            self.http
+                .request(method, format!("{}{path}", self.cfg.base)),
+        )
+    }
+
+    /// Like [`Self::req`], but each segment is percent-encoded, for paths that carry caller strings.
+    fn req_segments(
+        &self,
+        method: reqwest::Method,
+        segments: &[&str],
+    ) -> Result<reqwest::RequestBuilder> {
+        let url = segment_url(&self.cfg.base, segments)?;
+        Ok(self.authed(self.http.request(method, url)))
+    }
+
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.basic_auth(&self.cfg.email, Some(&self.cfg.token))
             .header("Accept", "application/json")
     }
 
@@ -376,6 +391,37 @@ impl JiraClient {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
+    /// An issue entity property's value, or `None` when Jira answers 404 (no such property, or no
+    /// issue the account can see).
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn get_issue_property(&self, key: &str, property_key: &str) -> Result<Option<Value>> {
+        let req = self.req_segments(
+            reqwest::Method::GET,
+            &["rest", "api", "3", "issue", key, "properties", property_key],
+        )?;
+        self.send_or_missing(req, "get_issue_property")
+            .await?
+            .map(property_value)
+            .transpose()
+    }
+
+    /// Create or replace an issue entity property. `value` is stored verbatim as the property.
+    #[tracing::instrument(level = "debug", skip(self, value), err)]
+    pub async fn set_issue_property(
+        &self,
+        key: &str,
+        property_key: &str,
+        value: &Value,
+    ) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        let req = self.req_segments(
+            reqwest::Method::PUT,
+            &["rest", "api", "3", "issue", key, "properties", property_key],
+        )?;
+        self.send(req.json(value), "set_issue_property").await?;
+        Ok(())
+    }
+
     /// Users matching an email, username, or display name. Raw user objects.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn user_search(&self, query: &str, limit: u32) -> Result<Vec<Value>> {
@@ -410,6 +456,25 @@ impl JiraClient {
     /// Send, then map a non-2xx to an error carrying the (truncated) body. A 204/empty body becomes
     /// `null` rather than a parse error, which is what the write endpoints return.
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<Value> {
+        let (status, text) = self.exchange(req, what).await?;
+        decode(what, status, &text)
+    }
+
+    /// [`Self::send`], except a 404 is `None` instead of an error.
+    async fn send_or_missing(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<Option<Value>> {
+        let (status, text) = self.exchange(req, what).await?;
+        missing_as_none(what, status, &text)
+    }
+
+    async fn exchange(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<(reqwest::StatusCode, String)> {
         let req = req
             .build()
             .with_context(|| format!("building the jira {what} request"))?;
@@ -421,17 +486,55 @@ impl JiraClient {
             .with_context(|| format!("jira {what} request"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            tracing::debug!(what, %status, bytes = text.len(), "jira response");
-        } else {
-            tracing::warn!(what, %status, body = %truncate(&text, 400), "jira request failed");
-            bail!("jira {what} failed ({status}): {}", truncate(&text, 400));
-        }
-        if text.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str(&text)
-            .with_context(|| format!("parsing jira {what} response: {}", truncate(&text, 200)))
+        Ok((status, text))
+    }
+}
+
+/// A response's status and body as a JSON value: non-2xx is an error, an empty body is `null`.
+fn decode(what: &str, status: reqwest::StatusCode, text: &str) -> Result<Value> {
+    if status.is_success() {
+        tracing::debug!(what, %status, bytes = text.len(), "jira response");
+    } else {
+        tracing::warn!(what, %status, body = %truncate(text, 400), "jira request failed");
+        bail!("jira {what} failed ({status}): {}", truncate(text, 400));
+    }
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(text)
+        .with_context(|| format!("parsing jira {what} response: {}", truncate(text, 200)))
+}
+
+/// [`decode`], with a 404 read as absence.
+fn missing_as_none(what: &str, status: reqwest::StatusCode, text: &str) -> Result<Option<Value>> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        tracing::debug!(what, %status, "jira resource absent");
+        return Ok(None);
+    }
+    decode(what, status, text).map(Some)
+}
+
+/// `base` with `segments` appended, each percent-encoded as a single path segment.
+fn segment_url(base: &str, segments: &[&str]) -> Result<reqwest::Url> {
+    let mut url =
+        reqwest::Url::parse(base).with_context(|| format!("parsing the jira base url {base}"))?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("the jira base url {base} cannot carry a path"))?
+        .pop_if_empty()
+        .extend(segments);
+    Ok(url)
+}
+
+/// The `value` of an issue property response (`{"key": .., "value": ..}`).
+fn property_value(body: Value) -> Result<Value> {
+    match body {
+        Value::Object(mut o) => o
+            .remove("value")
+            .context("jira issue property response has no value"),
+        other => bail!(
+            "jira issue property response is not an object: {}",
+            truncate(&other.to_string(), 200)
+        ),
     }
 }
 
@@ -725,5 +828,114 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-object issue at index 1"), "{err}");
+    }
+
+    #[test]
+    fn decode_maps_status_and_body() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            decode("x", StatusCode::OK, r#"{"a":1}"#).unwrap(),
+            json!({"a": 1})
+        );
+        assert_eq!(
+            decode("x", StatusCode::NO_CONTENT, "").unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            decode("x", StatusCode::CREATED, "  \n").unwrap(),
+            Value::Null
+        );
+        let err = decode("x", StatusCode::BAD_REQUEST, "nope")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("jira x failed (400 Bad Request): nope"),
+            "{err}"
+        );
+        let err = decode("x", StatusCode::NOT_FOUND, "gone")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("404"), "{err}");
+        assert!(decode("x", StatusCode::OK, "{not json").is_err());
+    }
+
+    #[test]
+    fn missing_as_none_reads_only_404_as_absent() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            missing_as_none("x", StatusCode::NOT_FOUND, r#"{"errorMessages":["no"]}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            missing_as_none("x", StatusCode::OK, r#"{"value":{}}"#).unwrap(),
+            Some(json!({"value": {}}))
+        );
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::GONE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(missing_as_none("x", status, "").is_err(), "{status}");
+        }
+    }
+
+    #[test]
+    fn property_value_returns_the_stored_value() {
+        assert_eq!(
+            property_value(json!({"key": "verdict", "value": {"ok": true}})).unwrap(),
+            json!({"ok": true})
+        );
+        assert_eq!(
+            property_value(json!({"key": "n", "value": 3})).unwrap(),
+            json!(3)
+        );
+        assert_eq!(
+            property_value(json!({"key": "n", "value": null})).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn property_value_rejects_a_malformed_body() {
+        let err = property_value(json!({"key": "verdict"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no value"), "{err}");
+        let err = property_value(Value::Null).unwrap_err().to_string();
+        assert!(err.contains("not an object"), "{err}");
+    }
+
+    #[test]
+    fn segment_url_encodes_each_segment() {
+        let url = segment_url(
+            "https://site.atlassian.net",
+            &[
+                "rest",
+                "api",
+                "3",
+                "issue",
+                "P-1",
+                "properties",
+                "a/b c?d#e",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://site.atlassian.net/rest/api/3/issue/P-1/properties/a%2Fb%20c%3Fd%23e"
+        );
+    }
+
+    #[test]
+    fn segment_url_keeps_a_base_path() {
+        let url = segment_url("https://host/jira", &["rest", "api", "3", "field"]).unwrap();
+        assert_eq!(url.as_str(), "https://host/jira/rest/api/3/field");
+    }
+
+    #[test]
+    fn segment_url_rejects_a_bad_base() {
+        assert!(segment_url("not a url", &["rest"]).is_err());
+        assert!(segment_url("mailto:me@example.com", &["rest"]).is_err());
     }
 }
