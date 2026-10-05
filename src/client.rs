@@ -11,7 +11,7 @@
 
 use crate::config::{Access, Config};
 use crate::fields::{FieldIndex, values_by_name};
-use crate::model::{ChangelogEntry, parse_items};
+use crate::model::{ChangelogEntry, Comment, parse_items};
 use crate::paging::{OffsetPages, SearchPages};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
@@ -171,6 +171,42 @@ impl JiraClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Every comment on an issue, oldest first, across all pages. Read through api/3, so bodies
+    /// are ADF; [`Self::get_comments`] is the plain-text, newest-N read.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn get_all_comments(&self, key: &str) -> Result<Vec<Comment>> {
+        let items = self
+            .offset_paged(
+                &["rest", "api", "3", "issue", key, "comment"],
+                &[("orderBy", "created")],
+                "comments",
+                "get_all_comments",
+            )
+            .await?;
+        parse_items("comment", items)
+    }
+
+    /// Replace an existing comment's body with an ADF document (api/v3).
+    #[tracing::instrument(level = "debug", skip(self, body_adf), err)]
+    pub async fn update_comment_adf(
+        &self,
+        key: &str,
+        comment_id: &str,
+        body_adf: Value,
+    ) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        self.send(
+            self.req_segments(
+                reqwest::Method::PUT,
+                &["rest", "api", "3", "issue", key, "comment", comment_id],
+            )?
+            .json(&json!({ "body": body_adf })),
+            "update_comment_adf",
+        )
+        .await?;
+        Ok(())
     }
 
     /// Post a comment with an ADF body (api/v3). Returns the new comment id.

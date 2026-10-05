@@ -41,6 +41,16 @@ pub struct ChangeItem {
     pub to_string: Option<String>,
 }
 
+/// A comment read through api/3, so `body` is an ADF document.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Comment {
+    pub id: String,
+    pub author: Option<Account>,
+    pub body: Value,
+    pub created: String,
+    pub updated: Option<String>,
+}
+
 /// Deserialize a list of raw items into `T`, naming the first item that does not fit.
 pub(crate) fn parse_items<T: DeserializeOwned>(what: &str, items: Vec<Value>) -> Result<Vec<T>> {
     items
@@ -101,6 +111,23 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(e.author, None);
+    }
+
+    #[test]
+    fn comment_keeps_the_adf_body() {
+        let body = json!({"type": "doc", "version": 1, "content": []});
+        let c: Comment = serde_json::from_value(json!({
+            "id": "10001",
+            "author": {"accountId": "557058:a"},
+            "body": body,
+            "created": "2026-10-04T12:00:00.000+0000",
+            "updated": "2026-10-04T13:00:00.000+0000",
+        }))
+        .unwrap();
+        assert_eq!(c.id, "10001");
+        assert_eq!(c.author.unwrap().account_id, "557058:a");
+        assert_eq!(c.body, body);
+        assert_eq!(c.updated.as_deref(), Some("2026-10-04T13:00:00.000+0000"));
     }
 
     #[test]
