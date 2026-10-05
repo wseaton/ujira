@@ -1,6 +1,6 @@
 # ujira
 
-µJIRA: MCP server and CLI for JIRA Cloud. Fourteen operations, compact plain-text output.
+µJIRA: MCP server and CLI for JIRA Cloud. Sixteen operations, compact plain-text output.
 
 Built for agents that read many issues and pay per token. Measured on one feature request with a long
 description, a dozen labels, and two links: 3422 chars rendered against 18151 chars of raw JSON. The
