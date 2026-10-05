@@ -50,6 +50,9 @@ pub struct Comment {
     pub body: Value,
     pub created: String,
     pub updated: Option<String>,
+    /// Who may see the comment (`{"type", "value", "identifier"}`), or `None` when it is public.
+    #[serde(default)]
+    pub visibility: Option<Value>,
 }
 
 /// A transition available from an issue's current status, with its screen fields.
@@ -201,6 +204,32 @@ mod tests {
         assert_eq!(c.author.unwrap().account_id, "557058:a");
         assert_eq!(c.body, body);
         assert_eq!(c.updated.as_deref(), Some("2026-10-04T13:00:00.000+0000"));
+        assert_eq!(c.visibility, None);
+    }
+
+    #[test]
+    fn comment_keeps_its_visibility_restriction_whole() {
+        let visibility = json!({
+            "type": "group",
+            "value": "Red Hat Employee",
+            "identifier": "13bd0387-d75c-4c18-9d37-5439e8bf984c",
+        });
+        let c: Comment = serde_json::from_value(json!({
+            "id": "10002",
+            "body": {"type": "doc", "version": 1, "content": []},
+            "created": "2026-10-04T12:00:00.000+0000",
+            "visibility": visibility,
+        }))
+        .unwrap();
+        assert_eq!(c.visibility, Some(visibility));
+        let public: Comment = serde_json::from_value(json!({
+            "id": "10003",
+            "body": {"type": "doc", "version": 1, "content": []},
+            "created": "2026-10-04T12:00:00.000+0000",
+            "visibility": null,
+        }))
+        .unwrap();
+        assert_eq!(public.visibility, None);
     }
 
     #[test]
