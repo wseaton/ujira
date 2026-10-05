@@ -43,6 +43,7 @@ fn default_encoding() -> String {
 pub struct SearchArgs {
     /// JQL, e.g. `project = PROJ AND labels = routing ORDER BY updated DESC`.
     pub jql: String,
+    #[allow(rustdoc::broken_intra_doc_links)]
     /// Max issues (clamped to [1,100]). Default 25.
     #[serde(default = "default_limit")]
     pub limit: u32,
@@ -70,6 +71,7 @@ pub struct GetIssueArgs {
 pub struct GetCommentsArgs {
     /// Issue key.
     pub issue_key: String,
+    #[allow(rustdoc::broken_intra_doc_links)]
     /// Newest N comments (clamped to [1,100]), rendered oldest-first. Default 25.
     #[serde(default = "default_limit")]
     pub limit: u32,
