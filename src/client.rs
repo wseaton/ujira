@@ -178,6 +178,19 @@ impl JiraClient {
         parse_items("changelog", items)
     }
 
+    /// One issue through api/3 with exactly the given field ids (`summary`, `customfield_10860`,
+    /// ...) and `expand` values (`renderedFields`, `names`, ...). Raw JSON; rich-text fields are ADF.
+    /// An empty `fields` leaves the choice to Jira (all navigable fields).
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn get_issue_v3(&self, key: &str, fields: &[&str], expand: &[&str]) -> Result<Value> {
+        self.send(
+            self.req_segments(reqwest::Method::GET, &["rest", "api", "3", "issue", key])?
+                .query(&issue_query(fields, expand)),
+            "get_issue_v3",
+        )
+        .await
+    }
+
     /// The newest `limit` comments on an issue.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn get_comments(&self, key: &str, limit: u32) -> Result<Vec<Value>> {
@@ -611,13 +624,7 @@ impl JiraClient {
         }
         let resolved = self.field_index().await?.resolve(names)?;
         let ids: Vec<&str> = resolved.iter().map(|(_, id)| id.as_str()).collect();
-        let issue = self
-            .send(
-                self.req_segments(reqwest::Method::GET, &["rest", "api", "3", "issue", key])?
-                    .query(&[("fields", ids.join(","))]),
-                "get_fields_by_name",
-            )
-            .await?;
+        let issue = self.get_issue_v3(key, &ids, &[]).await?;
         values_by_name(&issue, &resolved)
     }
 
@@ -842,6 +849,15 @@ fn labels_update(add: &[String], remove: &[String]) -> Option<Value> {
         .chain(remove.iter().map(|l| json!({ "remove": l })))
         .collect();
     Some(json!({ "update": { "labels": ops } }))
+}
+
+/// The `fields`/`expand` query of an issue GET, each comma-joined and left out when empty.
+fn issue_query(fields: &[&str], expand: &[&str]) -> Vec<(&'static str, String)> {
+    [("fields", fields), ("expand", expand)]
+        .into_iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(name, values)| (name, values.join(",")))
+        .collect()
 }
 
 fn issue_link_body(link_type: &str, source: &str, target: &str) -> Value {
@@ -1111,6 +1127,26 @@ mod tests {
             Some(json!({"update": {"labels": [
                 {"add": "new"}, {"remove": "old"}, {"remove": "stale"},
             ]}}))
+        );
+    }
+
+    #[test]
+    fn issue_query_joins_and_omits_empty_lists() {
+        assert!(issue_query(&[], &[]).is_empty());
+        assert_eq!(
+            issue_query(&["summary", "customfield_10860"], &[]),
+            [("fields", "summary,customfield_10860".to_string())]
+        );
+        assert_eq!(
+            issue_query(&["labels"], &["renderedFields", "names"]),
+            [
+                ("fields", "labels".to_string()),
+                ("expand", "renderedFields,names".to_string()),
+            ]
+        );
+        assert_eq!(
+            issue_query(&[], &["changelog"]),
+            [("expand", "changelog".to_string())]
         );
     }
 }
