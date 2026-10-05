@@ -193,6 +193,32 @@ mod tests {
     }
 
     #[test]
+    fn account_reads_a_myself_payload() {
+        let a: Account = serde_json::from_value(json!({
+            "self": "https://site.atlassian.net/rest/api/3/user?accountId=557058:a",
+            "accountId": "557058:a",
+            "accountType": "atlassian",
+            "emailAddress": "ada@example.com",
+            "avatarUrls": {"48x48": "x"},
+            "displayName": "Ada Lovelace",
+            "active": true,
+            "timeZone": "UTC",
+            "locale": "en_US",
+            "groups": {"size": 3, "items": []},
+        }))
+        .unwrap();
+        assert_eq!(
+            a,
+            Account {
+                account_id: "557058:a".into(),
+                display_name: Some("Ada Lovelace".into()),
+                email_address: Some("ada@example.com".into()),
+                active: Some(true),
+            }
+        );
+    }
+
+    #[test]
     fn account_requires_an_account_id() {
         assert!(serde_json::from_value::<Account>(json!({"displayName": "Ada"})).is_err());
     }

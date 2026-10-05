@@ -11,7 +11,7 @@
 
 use crate::config::{Access, Config};
 use crate::fields::{FieldIndex, values_by_name};
-use crate::model::{ChangelogEntry, Comment, Transition, parse_items, parse_transitions};
+use crate::model::{Account, ChangelogEntry, Comment, Transition, parse_items, parse_transitions};
 use crate::paging::{OffsetPages, SearchPages};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
@@ -585,6 +585,18 @@ impl JiraClient {
             .await?;
         let index = FieldIndex::from_metadata(&v)?;
         Ok(self.field_index.get_or_init(|| index))
+    }
+
+    /// The account the client authenticates as.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn myself(&self) -> Result<Account> {
+        let v = self
+            .send(
+                self.req(reqwest::Method::GET, "/rest/api/3/myself"),
+                "myself",
+            )
+            .await?;
+        serde_json::from_value(v).context("parsing jira myself response")
     }
 
     /// Users matching an email, username, or display name. Raw user objects.
