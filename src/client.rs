@@ -129,6 +129,23 @@ impl JiraClient {
         Ok(pages.into_issues())
     }
 
+    /// Jira's approximate count of issues matching `jql` (`/rest/api/3/search/approximate-count`).
+    /// Cheap, but may lag recent changes; use [`Self::search_all`] when exactness matters.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn approximate_count(&self, jql: &str) -> Result<u64> {
+        let v = self
+            .send(
+                self.req(
+                    reqwest::Method::POST,
+                    "/rest/api/3/search/approximate-count",
+                )
+                .json(&json!({ "jql": jql })),
+                "approximate_count",
+            )
+            .await?;
+        count_of(&v)
+    }
+
     /// One issue, plus its links and (optionally) its comments. `/rest/api/2` for plain-text prose.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn get_issue(&self, key: &str, with_comments: bool) -> Result<Value> {
@@ -772,6 +789,16 @@ fn assignee_body(account_id: Option<&str>) -> Value {
     json!({ "accountId": account_id })
 }
 
+/// The `count` of an approximate-count response.
+fn count_of(body: &Value) -> Result<u64> {
+    body.get("count").and_then(Value::as_u64).with_context(|| {
+        format!(
+            "jira approximate count response has no count: {}",
+            truncate(&body.to_string(), 200)
+        )
+    })
+}
+
 fn issue_link_body(link_type: &str, source: &str, target: &str) -> Value {
     json!({
         "type": {"name": link_type},
@@ -1001,5 +1028,21 @@ mod tests {
             json!({"accountId": "557058:a"})
         );
         assert_eq!(assignee_body(None), json!({"accountId": null}));
+    }
+
+    #[test]
+    fn count_of_reads_the_count() {
+        assert_eq!(count_of(&json!({"count": 0})).unwrap(), 0);
+        assert_eq!(count_of(&json!({"count": 1234})).unwrap(), 1234);
+        for bad in [
+            json!({}),
+            json!({"count": -1}),
+            json!({"count": "7"}),
+            json!({"count": 1.5}),
+            Value::Null,
+        ] {
+            let err = count_of(&bad).unwrap_err().to_string();
+            assert!(err.contains("has no count"), "{bad}: {err}");
+        }
     }
 }
