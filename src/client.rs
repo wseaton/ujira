@@ -382,6 +382,32 @@ impl JiraClient {
         Ok(())
     }
 
+    /// Assign an issue to an account through the `/assignee` endpoint.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn assign(&self, key: &str, account_id: &str) -> Result<()> {
+        self.put_assignee(key, Some(account_id), "assign").await
+    }
+
+    /// Clear an issue's assignee through the `/assignee` endpoint.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn unassign(&self, key: &str) -> Result<()> {
+        self.put_assignee(key, None, "unassign").await
+    }
+
+    async fn put_assignee(&self, key: &str, account_id: Option<&str>, what: &str) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        self.send(
+            self.req_segments(
+                reqwest::Method::PUT,
+                &["rest", "api", "3", "issue", key, "assignee"],
+            )?
+            .json(&assignee_body(account_id)),
+            what,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Link `source` to `target` using the link type's outward description.
     ///
     /// Jira's wire-format names are counterintuitive: the source belongs in `inwardIssue`, while
@@ -729,6 +755,11 @@ fn transition_body(id: &str, fields: Map<String, Value>, update: Map<String, Val
     Value::Object(body)
 }
 
+/// An `/assignee` PUT body: an account id, or `null` to unassign.
+fn assignee_body(account_id: Option<&str>) -> Value {
+    json!({ "accountId": account_id })
+}
+
 fn issue_link_body(link_type: &str, source: &str, target: &str) -> Value {
     json!({
         "type": {"name": link_type},
@@ -949,5 +980,14 @@ mod tests {
                 "update": update,
             })
         );
+    }
+
+    #[test]
+    fn assignee_body_sets_or_clears_the_account() {
+        assert_eq!(
+            assignee_body(Some("557058:a")),
+            json!({"accountId": "557058:a"})
+        );
+        assert_eq!(assignee_body(None), json!({"accountId": null}));
     }
 }
