@@ -20,13 +20,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// A connected JIRA Cloud client. Cheap to share behind an `Arc`.
 pub struct JiraClient {
     cfg: Config,
     http: reqwest::Client,
     field_index: OnceLock<FieldIndex>,
+    timeout: Duration,
 }
+
+/// How long one request may take, end to end, unless [`JiraClient::with_timeout`] says otherwise.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The page size asked of offset-paged endpoints (Jira caps changelog and comments at 100).
 const OFFSET_PAGE_SIZE: u32 = 100;
@@ -40,7 +45,18 @@ impl JiraClient {
             cfg,
             http: reqwest::Client::new(),
             field_index: OnceLock::new(),
+            timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Bound every request (connect, send, and read the response) to `timeout`.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     pub fn config(&self) -> &Config {
@@ -72,6 +88,7 @@ impl JiraClient {
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         req.basic_auth(&self.cfg.email, Some(&self.cfg.token))
             .header("Accept", "application/json")
+            .timeout(self.timeout)
     }
 
     /// The single choke point for authority: every mutating call goes through here first, so an
@@ -1148,5 +1165,44 @@ mod tests {
             issue_query(&[], &["changelog"]),
             [("expand", "changelog".to_string())]
         );
+    }
+
+    fn client() -> JiraClient {
+        JiraClient::new(Config {
+            base: "https://site.atlassian.net".into(),
+            email: "me@example.com".into(),
+            token: "t".into(),
+            token_source: crate::config::TokenSource::Inline,
+            access: Access::ReadWrite,
+            custom_fields: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn requests_carry_the_default_timeout() {
+        let jira = client();
+        assert_eq!(jira.timeout(), DEFAULT_TIMEOUT);
+        let req = jira
+            .req(reqwest::Method::GET, "/rest/api/3/myself")
+            .build()
+            .unwrap();
+        assert_eq!(req.timeout(), Some(&DEFAULT_TIMEOUT));
+    }
+
+    #[test]
+    fn with_timeout_applies_to_every_request_builder() {
+        let jira = client().with_timeout(Duration::from_secs(5));
+        assert_eq!(jira.timeout(), Duration::from_secs(5));
+        let plain = jira
+            .req(reqwest::Method::GET, "/rest/api/3/field")
+            .build()
+            .unwrap();
+        let segmented = jira
+            .req_segments(reqwest::Method::GET, &["rest", "api", "3", "issue", "P-1"])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(plain.timeout(), Some(&Duration::from_secs(5)));
+        assert_eq!(segmented.timeout(), Some(&Duration::from_secs(5)));
     }
 }
