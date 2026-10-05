@@ -33,7 +33,7 @@ compare key: build
 
 # Register with Claude Code at user scope (available in every project).
 claude-install: install
-    claude mcp add --scope user jira -- "$HOME/.cargo/bin/ujira"
+    claude mcp add --scope user jira -- "$HOME/.cargo/bin/ujira" mcp serve
 
 # Drop the heavyweight Atlassian MCP from Claude Code.
 claude-remove-atlassian:
