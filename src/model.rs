@@ -64,7 +64,7 @@ pub struct Transition {
     pub has_screen: bool,
     /// Field id -> field metadata, from `expand=transitions.fields`.
     #[serde(default)]
-    pub fields: BTreeMap<String, TransitionField>,
+    pub fields: BTreeMap<String, FieldMeta>,
 }
 
 impl Transition {
@@ -84,10 +84,10 @@ pub struct TransitionTarget {
     pub name: String,
 }
 
-/// A field on a transition's screen.
+/// A field's edit metadata, as on a transition screen or from editmeta.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TransitionField {
+pub struct FieldMeta {
     pub required: bool,
     pub name: String,
     pub key: Option<String>,
@@ -100,6 +100,17 @@ pub struct TransitionField {
     pub has_default_value: bool,
     #[serde(default)]
     pub operations: Vec<String>,
+}
+
+/// The `fields` map of an editmeta response: field id -> metadata.
+pub(crate) fn parse_edit_meta(body: Value) -> Result<BTreeMap<String, FieldMeta>> {
+    let Value::Object(mut o) = body else {
+        bail!("jira editmeta response is not an object");
+    };
+    let Some(fields) = o.remove("fields") else {
+        bail!("jira editmeta response has no fields");
+    };
+    serde_json::from_value(fields).context("parsing jira editmeta fields")
 }
 
 /// Deserialize a list of raw items into `T`, naming the first item that does not fit.
@@ -289,6 +300,56 @@ mod tests {
             (json!({"transitions": [{"name": "x"}]}), "transition item 0"),
         ] {
             let err = parse_transitions(v.clone()).unwrap_err().to_string();
+            assert!(err.contains(want), "{v}: {err}");
+        }
+    }
+
+    #[test]
+    fn edit_meta_parses_each_field() {
+        let meta = parse_edit_meta(json!({
+            "fields": {
+                "labels": {
+                    "required": false, "name": "Labels", "key": "labels",
+                    "schema": {"type": "array", "items": "string", "system": "labels"},
+                    "operations": ["add", "set", "remove"],
+                    "autoCompleteUrl": "https://x/rest/api/1.0/labels/suggest?query=",
+                },
+                "customfield_10860": {
+                    "required": true, "name": "Embargo Status", "key": "customfield_10860",
+                    "schema": {"type": "option", "custom": "select", "customId": 10860},
+                    "operations": ["set"],
+                    "allowedValues": [{"value": "True", "id": "1"}, {"value": "False", "id": "2"}],
+                    "hasDefaultValue": true,
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(meta.len(), 2);
+        let labels = &meta["labels"];
+        assert_eq!(labels.name, "Labels");
+        assert!(!labels.required);
+        assert_eq!(labels.operations, ["add", "set", "remove"]);
+        assert_eq!(labels.schema["type"], "array");
+        assert!(labels.allowed_values.is_empty());
+        let embargo = &meta["customfield_10860"];
+        assert!(embargo.required && embargo.has_default_value);
+        assert_eq!(embargo.key.as_deref(), Some("customfield_10860"));
+        assert_eq!(embargo.allowed_values[1]["value"], "False");
+        assert!(parse_edit_meta(json!({"fields": {}})).unwrap().is_empty());
+    }
+
+    #[test]
+    fn edit_meta_rejects_a_malformed_response() {
+        for (v, want) in [
+            (json!([]), "not an object"),
+            (json!({}), "has no fields"),
+            (json!({"fields": []}), "parsing jira editmeta fields"),
+            (
+                json!({"fields": {"x": {"name": "X"}}}),
+                "parsing jira editmeta fields",
+            ),
+        ] {
+            let err = parse_edit_meta(v.clone()).unwrap_err().to_string();
             assert!(err.contains(want), "{v}: {err}");
         }
     }

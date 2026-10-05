@@ -11,10 +11,14 @@
 
 use crate::config::{Access, Config};
 use crate::fields::{FieldIndex, values_by_name};
-use crate::model::{Account, ChangelogEntry, Comment, Transition, parse_items, parse_transitions};
+use crate::model::{
+    Account, ChangelogEntry, Comment, FieldMeta, Transition, parse_edit_meta, parse_items,
+    parse_transitions,
+};
 use crate::paging::{OffsetPages, SearchPages};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// A connected JIRA Cloud client. Cheap to share behind an `Arc`.
@@ -340,6 +344,22 @@ impl JiraClient {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// The fields the account may edit on an issue, by field id, with each one's schema,
+    /// required flag, allowed values, and operations (`/rest/api/3/issue/{key}/editmeta`).
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn edit_meta(&self, key: &str) -> Result<BTreeMap<String, FieldMeta>> {
+        let v = self
+            .send(
+                self.req_segments(
+                    reqwest::Method::GET,
+                    &["rest", "api", "3", "issue", key, "editmeta"],
+                )?,
+                "edit_meta",
+            )
+            .await?;
+        parse_edit_meta(v)
     }
 
     /// The transitions available from the issue's current status, with each one's screen fields
