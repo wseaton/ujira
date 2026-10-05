@@ -8,9 +8,11 @@ build:
 lint:
     cargo fmt
     cargo clippy --all --benches --tests --examples --all-features
+    cargo clippy --all-targets --no-default-features
 
 test:
     cargo test
+    cargo test --no-default-features
 
 # Verify credentials resolve and the site answers. Run this FIRST when an install misbehaves.
 check: build

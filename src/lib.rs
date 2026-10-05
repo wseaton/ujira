@@ -1,7 +1,7 @@
 //! A token-frugal JIRA Cloud client, its compact renderers, and the MCP server built on top.
 //!
 //! The binary (`src/main.rs`) is a thin wrapper: [`config::Config::load`] -> [`client::JiraClient`]
-//! -> [`server::JiraMcp`] over stdio.
+//! -> `server::JiraMcp` over stdio.
 //!
 //! # Embedding
 //!
@@ -26,7 +26,18 @@
 //! # }
 //! ```
 //!
-//! To expose this crate's full sixteen-tool surface instead, serve [`server::JiraMcp`] directly.
+//! To expose this crate's full sixteen-tool surface instead, serve `server::JiraMcp` directly.
+//!
+//! # Features
+//!
+//! | Feature | Default | Adds |
+//! | --- | --- | --- |
+//! | `cli` | yes | the `ujira` binary; implies `mcp` and `keychain` (clap, tokio, tracing-subscriber) |
+//! | `mcp` | via `cli` | `server` and `JiraMcp`, the MCP tool surface (rmcp) |
+//! | `keychain` | via `cli` | `keychain`, and the OS credential store as a token source (keyring) |
+//!
+//! `ujira = { version = "…", default-features = false }` builds the client, `model`, `fields`,
+//! `config`, `ops`, `render`, and `adf` on reqwest, serde, toml, and tracing alone.
 //!
 //! # Instrumentation
 //!
@@ -40,11 +51,16 @@ pub mod adf;
 pub mod client;
 pub mod config;
 pub mod fields;
+#[cfg(feature = "keychain")]
 pub mod keychain;
+pub mod model;
 pub mod ops;
+mod paging;
 pub mod render;
+#[cfg(feature = "mcp")]
 pub mod server;
 
 pub use client::JiraClient;
 pub use config::{Access, Config};
+#[cfg(feature = "mcp")]
 pub use server::JiraMcp;

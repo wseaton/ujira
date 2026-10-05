@@ -137,7 +137,8 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    /// Strict env-only resolution: `JIRA_URL` + `JIRA_USERNAME` + `JIRA_API_TOKEN`, or `None`.
+    /// Strict env-only resolution: `JIRA_URL` + the account (`JIRA_USERNAME`, else `JIRA_EMAIL`) +
+    /// `JIRA_API_TOKEN`, or `None`.
     ///
     /// For an embedding host that injects credentials itself and wants "JIRA is off" to be a normal
     /// state (report `disabled`) rather than a startup failure. It reads no files: it must not
@@ -145,7 +146,7 @@ impl Config {
     pub fn from_env() -> Option<Self> {
         Some(Self {
             base: env("JIRA_URL")?.trim_end_matches('/').to_string(),
-            email: env("JIRA_USERNAME")?,
+            email: env_account()?,
             token: env("JIRA_API_TOKEN")?,
             token_source: TokenSource::Env,
             access: env_access().unwrap_or(Access::ReadWrite),
@@ -169,10 +170,10 @@ impl Config {
             .context("no JIRA site url: set JIRA_URL or `url` in the config file")?
             .trim_end_matches('/')
             .to_string();
-        let email = env("JIRA_USERNAME")
+        let email = env_account()
             .or_else(|| file.username.clone())
             .or_else(|| cli_config_value("login"))
-            .context("no JIRA account email: set JIRA_USERNAME or `username` in the config file")?;
+            .context("no JIRA account email: set JIRA_USERNAME (or JIRA_EMAIL) or `username` in the config file")?;
         let (token, token_source) = resolve_token(file, defaults, &email)?;
         tracing::debug!(site = %base, account = %email, token = %token_source, "config resolved");
         let custom_fields = file
@@ -210,11 +211,17 @@ fn resolve_token(file: &File, defaults: &File, account: &str) -> Result<(String,
         .or(defaults.keychain)
         .unwrap_or(true);
     if use_keychain {
+        #[cfg(feature = "keychain")]
         match crate::keychain::get(account) {
             Some(t) if !t.trim().is_empty() => return Ok((t, TokenSource::Keychain)),
             Some(_) => tracing::debug!(account, "keychain entry is empty, trying the next source"),
             None => tracing::debug!(account, "no keychain entry, trying the next source"),
         }
+        #[cfg(not(feature = "keychain"))]
+        tracing::debug!(
+            account,
+            "built without the keychain feature, trying the next source"
+        );
     }
     let path = env("JIRA_API_TOKEN_FILE")
         .or_else(|| file.token_file.clone())
@@ -315,6 +322,18 @@ fn pairs(map: BTreeMap<String, String>) -> Vec<(String, String)> {
 }
 
 /// A non-empty env var.
+/// The env vars naming the account email, most preferred first.
+const ACCOUNT_VARS: [&str; 2] = ["JIRA_USERNAME", "JIRA_EMAIL"];
+
+fn env_account() -> Option<String> {
+    account_from(env)
+}
+
+/// The first of [`ACCOUNT_VARS`] that `lookup` finds.
+fn account_from(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ACCOUNT_VARS.iter().find_map(|k| lookup(k))
+}
+
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
@@ -390,10 +409,10 @@ fn scrape(text: &str, key: &str) -> Option<String> {
 /// The token-management commands need this: you can't require a working config to store the
 /// credential the config is missing.
 pub fn account() -> Result<String> {
-    env("JIRA_USERNAME")
+    env_account()
         .or_else(|| file_config().ok().and_then(|f| f.username))
         .or_else(|| cli_config_value("login"))
-        .context("no JIRA account email: set JIRA_USERNAME or `username` in the config file")
+        .context("no JIRA account email: set JIRA_USERNAME (or JIRA_EMAIL) or `username` in the config file")
 }
 
 /// The shipped config template, verbatim — what `--write-config` drops on disk.
@@ -487,5 +506,32 @@ mod tests {
         );
         assert_eq!(scrape(yaml, "login").as_deref(), Some("me@x.com"));
         assert_eq!(scrape(yaml, "nope"), None);
+    }
+
+    #[test]
+    fn account_prefers_jira_username_over_jira_email() {
+        let vars = |set: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                set.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(account_from(vars(&[])), None);
+        assert_eq!(
+            account_from(vars(&[("JIRA_EMAIL", "e@x.com")])),
+            Some("e@x.com".into())
+        );
+        assert_eq!(
+            account_from(vars(&[("JIRA_USERNAME", "u@x.com")])),
+            Some("u@x.com".into())
+        );
+        assert_eq!(
+            account_from(vars(&[
+                ("JIRA_EMAIL", "e@x.com"),
+                ("JIRA_USERNAME", "u@x.com")
+            ])),
+            Some("u@x.com".into())
+        );
     }
 }

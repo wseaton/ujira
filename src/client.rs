@@ -11,17 +11,30 @@
 
 use crate::config::{Access, Config};
 use crate::fields::{FieldIndex, values_by_name};
+use crate::model::{
+    Account, ChangelogEntry, Comment, FieldMeta, Transition, parse_edit_meta, parse_items,
+    parse_transitions,
+};
+use crate::paging::{OffsetPages, SearchPages};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// A connected JIRA Cloud client. Cheap to share behind an `Arc`.
 pub struct JiraClient {
     cfg: Config,
     http: reqwest::Client,
     field_index: OnceLock<FieldIndex>,
+    timeout: Duration,
 }
+
+/// How long one request may take, end to end, unless [`JiraClient::with_timeout`] says otherwise.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The page size asked of offset-paged endpoints (Jira caps changelog and comments at 100).
+const OFFSET_PAGE_SIZE: u32 = 100;
 
 /// The compact fields a search row carries (enough to triage; `get_issue` for detail).
 const SEARCH_FIELDS: &[&str] = &["summary", "status", "issuetype", "labels", "assignee"];
@@ -32,7 +45,18 @@ impl JiraClient {
             cfg,
             http: reqwest::Client::new(),
             field_index: OnceLock::new(),
+            timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Bound every request (connect, send, and read the response) to `timeout`.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     pub fn config(&self) -> &Config {
@@ -64,6 +88,7 @@ impl JiraClient {
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         req.basic_auth(&self.cfg.email, Some(&self.cfg.token))
             .header("Accept", "application/json")
+            .timeout(self.timeout)
     }
 
     /// The single choke point for authority: every mutating call goes through here first, so an
@@ -125,6 +150,23 @@ impl JiraClient {
         Ok(pages.into_issues())
     }
 
+    /// Jira's approximate count of issues matching `jql` (`/rest/api/3/search/approximate-count`).
+    /// Cheap, but may lag recent changes; use [`Self::search_all`] when exactness matters.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn approximate_count(&self, jql: &str) -> Result<u64> {
+        let v = self
+            .send(
+                self.req(
+                    reqwest::Method::POST,
+                    "/rest/api/3/search/approximate-count",
+                )
+                .json(&json!({ "jql": jql })),
+                "approximate_count",
+            )
+            .await?;
+        count_of(&v)
+    }
+
     /// One issue, plus its links and (optionally) its comments. `/rest/api/2` for plain-text prose.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn get_issue(&self, key: &str, with_comments: bool) -> Result<Value> {
@@ -137,6 +179,33 @@ impl JiraClient {
         };
         self.send(self.req(reqwest::Method::GET, &path), "get_issue")
             .await
+    }
+
+    /// Every changelog history of an issue, oldest first, across all pages.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn changelog(&self, key: &str) -> Result<Vec<ChangelogEntry>> {
+        let items = self
+            .offset_paged(
+                &["rest", "api", "3", "issue", key, "changelog"],
+                &[],
+                "values",
+                "changelog",
+            )
+            .await?;
+        parse_items("changelog", items)
+    }
+
+    /// One issue through api/3 with exactly the given field ids (`summary`, `customfield_10860`,
+    /// ...) and `expand` values (`renderedFields`, `names`, ...). Raw JSON; rich-text fields are ADF.
+    /// An empty `fields` leaves the choice to Jira (all navigable fields).
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn get_issue_v3(&self, key: &str, fields: &[&str], expand: &[&str]) -> Result<Value> {
+        self.send(
+            self.req_segments(reqwest::Method::GET, &["rest", "api", "3", "issue", key])?
+                .query(&issue_query(fields, expand)),
+            "get_issue_v3",
+        )
+        .await
     }
 
     /// The newest `limit` comments on an issue.
@@ -153,6 +222,42 @@ impl JiraClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Every comment on an issue, oldest first, across all pages. Read through api/3, so bodies
+    /// are ADF; [`Self::get_comments`] is the plain-text, newest-N read.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn get_all_comments(&self, key: &str) -> Result<Vec<Comment>> {
+        let items = self
+            .offset_paged(
+                &["rest", "api", "3", "issue", key, "comment"],
+                &[("orderBy", "created")],
+                "comments",
+                "get_all_comments",
+            )
+            .await?;
+        parse_items("comment", items)
+    }
+
+    /// Replace an existing comment's body with an ADF document (api/v3).
+    #[tracing::instrument(level = "debug", skip(self, body_adf), err)]
+    pub async fn update_comment_adf(
+        &self,
+        key: &str,
+        comment_id: &str,
+        body_adf: Value,
+    ) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        self.send(
+            self.req_segments(
+                reqwest::Method::PUT,
+                &["rest", "api", "3", "issue", key, "comment", comment_id],
+            )?
+            .json(&json!({ "body": body_adf })),
+            "update_comment_adf",
+        )
+        .await?;
+        Ok(())
     }
 
     /// Post a comment with an ADF body (api/v3). Returns the new comment id.
@@ -271,6 +376,63 @@ impl JiraClient {
             .unwrap_or_default())
     }
 
+    /// The fields the account may edit on an issue, by field id, with each one's schema,
+    /// required flag, allowed values, and operations (`/rest/api/3/issue/{key}/editmeta`).
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn edit_meta(&self, key: &str) -> Result<BTreeMap<String, FieldMeta>> {
+        let v = self
+            .send(
+                self.req_segments(
+                    reqwest::Method::GET,
+                    &["rest", "api", "3", "issue", key, "editmeta"],
+                )?,
+                "edit_meta",
+            )
+            .await?;
+        parse_edit_meta(v)
+    }
+
+    /// The transitions available from the issue's current status, with each one's screen fields
+    /// (`expand=transitions.fields`), so a caller can see which fields a transition requires.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn transitions_with_fields(&self, key: &str) -> Result<Vec<Transition>> {
+        let v = self
+            .send(
+                self.req_segments(
+                    reqwest::Method::GET,
+                    &["rest", "api", "3", "issue", key, "transitions"],
+                )?
+                .query(&[("expand", "transitions.fields")]),
+                "transitions_with_fields",
+            )
+            .await?;
+        parse_transitions(v)
+    }
+
+    /// Drive a transition by id, setting screen `fields` (e.g. `resolution`) and applying `update`
+    /// operations in the same request. api/v3, so rich-text values must be ADF. Empty maps are
+    /// left out of the request.
+    #[tracing::instrument(level = "debug", skip(self, fields, update), err)]
+    pub async fn transition_with_fields(
+        &self,
+        key: &str,
+        id: &str,
+        fields: Map<String, Value>,
+        update: Map<String, Value>,
+    ) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        self.send(
+            self.req_segments(
+                reqwest::Method::POST,
+                &["rest", "api", "3", "issue", key, "transitions"],
+            )?
+            .json(&transition_body(id, fields, update)),
+            "transition_with_fields",
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Drive a transition by id (resolve the name first with [`Self::transitions`]).
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn transition(&self, key: &str, id: &str) -> Result<()> {
@@ -282,6 +444,32 @@ impl JiraClient {
             )
             .json(&json!({"transition": {"id": id}})),
             "transition",
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Assign an issue to an account through the `/assignee` endpoint.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn assign(&self, key: &str, account_id: &str) -> Result<()> {
+        self.put_assignee(key, Some(account_id), "assign").await
+    }
+
+    /// Clear an issue's assignee through the `/assignee` endpoint.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn unassign(&self, key: &str) -> Result<()> {
+        self.put_assignee(key, None, "unassign").await
+    }
+
+    async fn put_assignee(&self, key: &str, account_id: Option<&str>, what: &str) -> Result<()> {
+        self.require(Access::ReadWrite)?;
+        self.send(
+            self.req_segments(
+                reqwest::Method::PUT,
+                &["rest", "api", "3", "issue", key, "assignee"],
+            )?
+            .json(&assignee_body(account_id)),
+            what,
         )
         .await?;
         Ok(())
@@ -321,26 +509,37 @@ impl JiraClient {
     /// Incremental label add: appends without replacing the existing set.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn add_labels(&self, key: &str, labels: &[String]) -> Result<()> {
-        self.require(Access::ReadWrite)?;
-        let ops: Vec<Value> = labels.iter().map(|l| json!({"add": l})).collect();
-        self.send(
-            self.req(reqwest::Method::PUT, &format!("/rest/api/2/issue/{key}"))
-                .json(&json!({"update": {"labels": ops}})),
-            "add_labels",
-        )
-        .await?;
-        Ok(())
+        self.put_labels(key, labels, &[], "add_labels").await
     }
 
     /// Incremental label remove: drops specific labels without touching the rest.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn remove_labels(&self, key: &str, labels: &[String]) -> Result<()> {
+        self.put_labels(key, &[], labels, "remove_labels").await
+    }
+
+    /// Add and remove labels in one request, so the issue never shows a half-applied edit.
+    /// Leaves the other labels alone. Sends nothing when both lists are empty.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn edit_labels(&self, key: &str, add: &[String], remove: &[String]) -> Result<()> {
+        self.put_labels(key, add, remove, "edit_labels").await
+    }
+
+    async fn put_labels(
+        &self,
+        key: &str,
+        add: &[String],
+        remove: &[String],
+        what: &str,
+    ) -> Result<()> {
         self.require(Access::ReadWrite)?;
-        let ops: Vec<Value> = labels.iter().map(|l| json!({"remove": l})).collect();
+        let Some(body) = labels_update(add, remove) else {
+            return Ok(());
+        };
         self.send(
             self.req(reqwest::Method::PUT, &format!("/rest/api/2/issue/{key}"))
-                .json(&json!({"update": {"labels": ops}})),
-            "remove_labels",
+                .json(&body),
+            what,
         )
         .await?;
         Ok(())
@@ -442,13 +641,7 @@ impl JiraClient {
         }
         let resolved = self.field_index().await?.resolve(names)?;
         let ids: Vec<&str> = resolved.iter().map(|(_, id)| id.as_str()).collect();
-        let issue = self
-            .send(
-                self.req_segments(reqwest::Method::GET, &["rest", "api", "3", "issue", key])?
-                    .query(&[("fields", ids.join(","))]),
-                "get_fields_by_name",
-            )
-            .await?;
+        let issue = self.get_issue_v3(key, &ids, &[]).await?;
         values_by_name(&issue, &resolved)
     }
 
@@ -464,6 +657,18 @@ impl JiraClient {
             .await?;
         let index = FieldIndex::from_metadata(&v)?;
         Ok(self.field_index.get_or_init(|| index))
+    }
+
+    /// The account the client authenticates as.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn myself(&self) -> Result<Account> {
+        let v = self
+            .send(
+                self.req(reqwest::Method::GET, "/rest/api/3/myself"),
+                "myself",
+            )
+            .await?;
+        serde_json::from_value(v).context("parsing jira myself response")
     }
 
     /// Users matching an email, username, or display name. Raw user objects.
@@ -495,6 +700,32 @@ impl JiraClient {
             )
             .await?;
         Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// GET every page of a `startAt`/`maxResults` endpoint and return the raw items.
+    async fn offset_paged(
+        &self,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        items_key: &'static str,
+        what: &str,
+    ) -> Result<Vec<Value>> {
+        let mut pages = OffsetPages::new(items_key);
+        while let Some(start) = pages.next_start() {
+            let page = self
+                .send(
+                    self.req_segments(reqwest::Method::GET, segments)?
+                        .query(query)
+                        .query(&[
+                            ("startAt", start.to_string()),
+                            ("maxResults", OFFSET_PAGE_SIZE.to_string()),
+                        ]),
+                    what,
+                )
+                .await?;
+            pages.accept(page)?;
+        }
+        Ok(pages.into_items())
     }
 
     /// Send, then map a non-2xx to an error carrying the (truncated) body. A 204/empty body becomes
@@ -582,81 +813,6 @@ fn property_value(body: Value) -> Result<Value> {
     }
 }
 
-/// The largest page [`JiraClient::search_all`] asks for.
-const SEARCH_PAGE_SIZE: u32 = 50;
-
-/// The next `search/jql` request [`SearchPages`] wants made.
-#[derive(Debug, PartialEq, Eq)]
-struct PageRequest {
-    size: u32,
-    token: Option<String>,
-}
-
-/// Token-paging state for `search/jql`: which page to ask for next, and what came back so far.
-struct SearchPages {
-    max: usize,
-    issues: Vec<Value>,
-    token: Option<String>,
-    seen: HashSet<String>,
-    done: bool,
-}
-
-impl SearchPages {
-    fn new(max_results: u32) -> Self {
-        Self {
-            max: max_results as usize,
-            issues: Vec::new(),
-            token: None,
-            seen: HashSet::new(),
-            done: false,
-        }
-    }
-
-    /// The next page to fetch, or `None` once the last page or `max_results` is reached.
-    fn next_request(&self) -> Option<PageRequest> {
-        let remaining = self.max.saturating_sub(self.issues.len());
-        if self.done || remaining == 0 {
-            return None;
-        }
-        let size = u32::try_from(remaining).map_or(SEARCH_PAGE_SIZE, |r| r.min(SEARCH_PAGE_SIZE));
-        Some(PageRequest {
-            size,
-            token: self.token.clone(),
-        })
-    }
-
-    /// Take one `search/jql` response body.
-    fn accept(&mut self, page: Value) -> Result<()> {
-        let Some(issues) = page.get("issues").and_then(Value::as_array) else {
-            bail!("jira search returned no issues array");
-        };
-        if let Some(i) = issues.iter().position(|issue| !issue.is_object()) {
-            bail!("jira search returned a non-object issue at index {i}");
-        }
-        let room = self.max.saturating_sub(self.issues.len());
-        self.issues.extend(issues.iter().take(room).cloned());
-        if page.get("isLast").and_then(Value::as_bool) == Some(true)
-            || self.issues.len() >= self.max
-        {
-            self.done = true;
-            return Ok(());
-        }
-        let token = match page.get("nextPageToken").and_then(Value::as_str) {
-            Some(t) if !t.is_empty() => t.to_string(),
-            _ => bail!("jira search omitted nextPageToken on a page that is not the last"),
-        };
-        if !self.seen.insert(token.clone()) {
-            bail!("jira search repeated nextPageToken {token}");
-        }
-        self.token = Some(token);
-        Ok(())
-    }
-
-    fn into_issues(self) -> Vec<Value> {
-        self.issues
-    }
-}
-
 fn id_of(v: &Value) -> String {
     v.get("id")
         .map(|i| match i {
@@ -668,6 +824,57 @@ fn id_of(v: &Value) -> String {
 
 fn str_at<'a>(v: &'a Value, ptr: &str) -> &'a str {
     v.pointer(ptr).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// A transitions POST body; `fields` and `update` only when non-empty.
+fn transition_body(id: &str, fields: Map<String, Value>, update: Map<String, Value>) -> Value {
+    let mut body = Map::new();
+    body.insert("transition".into(), json!({ "id": id }));
+    if !fields.is_empty() {
+        body.insert("fields".into(), Value::Object(fields));
+    }
+    if !update.is_empty() {
+        body.insert("update".into(), Value::Object(update));
+    }
+    Value::Object(body)
+}
+
+/// An `/assignee` PUT body: an account id, or `null` to unassign.
+fn assignee_body(account_id: Option<&str>) -> Value {
+    json!({ "accountId": account_id })
+}
+
+/// The `count` of an approximate-count response.
+fn count_of(body: &Value) -> Result<u64> {
+    body.get("count").and_then(Value::as_u64).with_context(|| {
+        format!(
+            "jira approximate count response has no count: {}",
+            truncate(&body.to_string(), 200)
+        )
+    })
+}
+
+/// An issue PUT body applying `update.labels` add and remove operations, or `None` when there
+/// is nothing to do.
+fn labels_update(add: &[String], remove: &[String]) -> Option<Value> {
+    if add.is_empty() && remove.is_empty() {
+        return None;
+    }
+    let ops: Vec<Value> = add
+        .iter()
+        .map(|l| json!({ "add": l }))
+        .chain(remove.iter().map(|l| json!({ "remove": l })))
+        .collect();
+    Some(json!({ "update": { "labels": ops } }))
+}
+
+/// The `fields`/`expand` query of an issue GET, each comma-joined and left out when empty.
+fn issue_query(fields: &[&str], expand: &[&str]) -> Vec<(&'static str, String)> {
+    [("fields", fields), ("expand", expand)]
+        .into_iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(name, values)| (name, values.join(",")))
+        .collect()
 }
 
 fn issue_link_body(link_type: &str, source: &str, target: &str) -> Value {
@@ -735,143 +942,6 @@ mod tests {
         let body = issue_link_body("Depend", "PROJ-1", "PROJ-2");
         assert_eq!(body["inwardIssue"]["key"], "PROJ-1");
         assert_eq!(body["outwardIssue"]["key"], "PROJ-2");
-    }
-
-    fn issues(range: std::ops::Range<u32>) -> Vec<Value> {
-        range.map(|n| json!({"key": format!("P-{n}")})).collect()
-    }
-
-    fn keys(issues: &[Value]) -> Vec<&str> {
-        issues.iter().map(|i| str_at(i, "/key")).collect()
-    }
-
-    #[test]
-    fn search_pages_walks_tokens_until_is_last() {
-        let mut p = SearchPages::new(500);
-        assert_eq!(
-            p.next_request(),
-            Some(PageRequest {
-                size: 50,
-                token: None
-            })
-        );
-        p.accept(json!({"issues": issues(0..50), "nextPageToken": "t1", "isLast": false}))
-            .unwrap();
-        assert_eq!(
-            p.next_request(),
-            Some(PageRequest {
-                size: 50,
-                token: Some("t1".into())
-            })
-        );
-        p.accept(json!({"issues": issues(50..60), "isLast": true}))
-            .unwrap();
-        assert_eq!(p.next_request(), None);
-        let all = p.into_issues();
-        assert_eq!(all.len(), 60);
-        assert_eq!(keys(&all)[59], "P-59");
-    }
-
-    #[test]
-    fn search_pages_shrinks_the_last_page_to_the_remaining_budget() {
-        let mut p = SearchPages::new(70);
-        assert_eq!(p.next_request().map(|r| r.size), Some(50));
-        p.accept(json!({"issues": issues(0..50), "nextPageToken": "t1"}))
-            .unwrap();
-        assert_eq!(p.next_request().map(|r| r.size), Some(20));
-        p.accept(json!({"issues": issues(50..70), "nextPageToken": "t2"}))
-            .unwrap();
-        assert_eq!(p.next_request(), None);
-        assert_eq!(p.into_issues().len(), 70);
-    }
-
-    #[test]
-    fn search_pages_stops_at_max_without_needing_a_token() {
-        let mut p = SearchPages::new(3);
-        assert_eq!(p.next_request().map(|r| r.size), Some(3));
-        p.accept(json!({"issues": issues(0..3), "isLast": false}))
-            .unwrap();
-        assert_eq!(p.next_request(), None);
-        assert_eq!(keys(&p.into_issues()), ["P-0", "P-1", "P-2"]);
-    }
-
-    #[test]
-    fn search_pages_never_returns_more_than_max() {
-        let mut p = SearchPages::new(2);
-        p.accept(json!({"issues": issues(0..5), "nextPageToken": "t1"}))
-            .unwrap();
-        assert_eq!(p.next_request(), None);
-        assert_eq!(keys(&p.into_issues()), ["P-0", "P-1"]);
-    }
-
-    #[test]
-    fn search_pages_with_zero_max_asks_for_nothing() {
-        let p = SearchPages::new(0);
-        assert_eq!(p.next_request(), None);
-        assert!(p.into_issues().is_empty());
-    }
-
-    #[test]
-    fn search_pages_accepts_an_empty_last_page() {
-        let mut p = SearchPages::new(10);
-        p.accept(json!({"issues": [], "isLast": true})).unwrap();
-        assert_eq!(p.next_request(), None);
-        assert!(p.into_issues().is_empty());
-    }
-
-    #[test]
-    fn search_pages_fails_when_a_non_last_page_omits_its_token() {
-        for page in [
-            json!({"issues": issues(0..50), "isLast": false}),
-            json!({"issues": issues(0..50)}),
-            json!({"issues": issues(0..50), "nextPageToken": ""}),
-            json!({"issues": issues(0..50), "nextPageToken": null}),
-            json!({"issues": issues(0..50), "nextPageToken": 7}),
-            json!({"issues": issues(0..50), "isLast": "true", "nextPageToken": null}),
-        ] {
-            let mut p = SearchPages::new(500);
-            let err = p.accept(page.clone()).unwrap_err().to_string();
-            assert!(err.contains("omitted nextPageToken"), "{page}: {err}");
-        }
-    }
-
-    #[test]
-    fn search_pages_fails_when_a_token_repeats() {
-        let mut p = SearchPages::new(500);
-        p.accept(json!({"issues": issues(0..50), "nextPageToken": "t1"}))
-            .unwrap();
-        p.accept(json!({"issues": issues(50..100), "nextPageToken": "t2"}))
-            .unwrap();
-        let err = p
-            .accept(json!({"issues": issues(100..150), "nextPageToken": "t1"}))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("repeated nextPageToken t1"), "{err}");
-    }
-
-    #[test]
-    fn search_pages_fails_when_issues_is_not_an_array() {
-        for page in [
-            json!({"isLast": true}),
-            json!({"issues": null, "isLast": true}),
-            json!({"issues": {"key": "P-1"}, "isLast": true}),
-            json!([]),
-            Value::Null,
-        ] {
-            let mut p = SearchPages::new(10);
-            let err = p.accept(page.clone()).unwrap_err().to_string();
-            assert!(err.contains("no issues array"), "{page}: {err}");
-        }
-    }
-
-    #[test]
-    fn search_pages_fails_on_a_non_object_issue() {
-        let mut p = SearchPages::new(10);
-        let err = p
-            .accept(json!({"issues": [{"key": "P-1"}, "P-2"], "isLast": true}))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("non-object issue at index 1"), "{err}");
     }
 
     #[test]
@@ -981,5 +1051,158 @@ mod tests {
     fn segment_url_rejects_a_bad_base() {
         assert!(segment_url("not a url", &["rest"]).is_err());
         assert!(segment_url("mailto:me@example.com", &["rest"]).is_err());
+    }
+
+    fn object(v: Value) -> Map<String, Value> {
+        match v {
+            Value::Object(o) => o,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    #[test]
+    fn transition_body_carries_only_what_is_set() {
+        assert_eq!(
+            transition_body("11", Map::new(), Map::new()),
+            json!({"transition": {"id": "11"}})
+        );
+        assert_eq!(
+            transition_body(
+                "61",
+                object(json!({
+                    "resolution": {"name": "Done"},
+                    "customfield_10500": {"value": "Yes"},
+                })),
+                Map::new(),
+            ),
+            json!({
+                "transition": {"id": "61"},
+                "fields": {"resolution": {"name": "Done"}, "customfield_10500": {"value": "Yes"}},
+            })
+        );
+        let update = json!({"labels": [{"add": "closed-by-bot"}]});
+        assert_eq!(
+            transition_body("61", Map::new(), object(update.clone())),
+            json!({"transition": {"id": "61"}, "update": update})
+        );
+        assert_eq!(
+            transition_body(
+                "61",
+                object(json!({"resolution": {"name": "Done"}})),
+                object(update.clone())
+            ),
+            json!({
+                "transition": {"id": "61"},
+                "fields": {"resolution": {"name": "Done"}},
+                "update": update,
+            })
+        );
+    }
+
+    #[test]
+    fn assignee_body_sets_or_clears_the_account() {
+        assert_eq!(
+            assignee_body(Some("557058:a")),
+            json!({"accountId": "557058:a"})
+        );
+        assert_eq!(assignee_body(None), json!({"accountId": null}));
+    }
+
+    #[test]
+    fn count_of_reads_the_count() {
+        assert_eq!(count_of(&json!({"count": 0})).unwrap(), 0);
+        assert_eq!(count_of(&json!({"count": 1234})).unwrap(), 1234);
+        for bad in [
+            json!({}),
+            json!({"count": -1}),
+            json!({"count": "7"}),
+            json!({"count": 1.5}),
+            Value::Null,
+        ] {
+            let err = count_of(&bad).unwrap_err().to_string();
+            assert!(err.contains("has no count"), "{bad}: {err}");
+        }
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn labels_update_puts_adds_and_removes_in_one_body() {
+        assert_eq!(labels_update(&[], &[]), None);
+        assert_eq!(
+            labels_update(&strings(&["a", "b"]), &[]),
+            Some(json!({"update": {"labels": [{"add": "a"}, {"add": "b"}]}}))
+        );
+        assert_eq!(
+            labels_update(&[], &strings(&["c"])),
+            Some(json!({"update": {"labels": [{"remove": "c"}]}}))
+        );
+        assert_eq!(
+            labels_update(&strings(&["new"]), &strings(&["old", "stale"])),
+            Some(json!({"update": {"labels": [
+                {"add": "new"}, {"remove": "old"}, {"remove": "stale"},
+            ]}}))
+        );
+    }
+
+    #[test]
+    fn issue_query_joins_and_omits_empty_lists() {
+        assert!(issue_query(&[], &[]).is_empty());
+        assert_eq!(
+            issue_query(&["summary", "customfield_10860"], &[]),
+            [("fields", "summary,customfield_10860".to_string())]
+        );
+        assert_eq!(
+            issue_query(&["labels"], &["renderedFields", "names"]),
+            [
+                ("fields", "labels".to_string()),
+                ("expand", "renderedFields,names".to_string()),
+            ]
+        );
+        assert_eq!(
+            issue_query(&[], &["changelog"]),
+            [("expand", "changelog".to_string())]
+        );
+    }
+
+    fn client() -> JiraClient {
+        JiraClient::new(Config {
+            base: "https://site.atlassian.net".into(),
+            email: "me@example.com".into(),
+            token: "t".into(),
+            token_source: crate::config::TokenSource::Inline,
+            access: Access::ReadWrite,
+            custom_fields: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn requests_carry_the_default_timeout() {
+        let jira = client();
+        assert_eq!(jira.timeout(), DEFAULT_TIMEOUT);
+        let req = jira
+            .req(reqwest::Method::GET, "/rest/api/3/myself")
+            .build()
+            .unwrap();
+        assert_eq!(req.timeout(), Some(&DEFAULT_TIMEOUT));
+    }
+
+    #[test]
+    fn with_timeout_applies_to_every_request_builder() {
+        let jira = client().with_timeout(Duration::from_secs(5));
+        assert_eq!(jira.timeout(), Duration::from_secs(5));
+        let plain = jira
+            .req(reqwest::Method::GET, "/rest/api/3/field")
+            .build()
+            .unwrap();
+        let segmented = jira
+            .req_segments(reqwest::Method::GET, &["rest", "api", "3", "issue", "P-1"])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(plain.timeout(), Some(&Duration::from_secs(5)));
+        assert_eq!(segmented.timeout(), Some(&Duration::from_secs(5)));
     }
 }

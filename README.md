@@ -36,7 +36,7 @@ variables and `jira-mcp/config.toml` are still read.
 | Key | Env | |
 | --- | --- | --- |
 | `url` | `JIRA_URL` | Site URL (falls back to a jira-cli config's `server:`) |
-| `username` | `JIRA_USERNAME` | Account email (falls back to jira-cli's `login:`) |
+| `username` | `JIRA_USERNAME`, else `JIRA_EMAIL` | Account email (falls back to jira-cli's `login:`) |
 | `access` | `UJIRA_ACCESS` | `read-only`, `read-comment`, or `read-write` (default) |
 | `keychain` | `UJIRA_KEYCHAIN` | Use the OS keychain (default true) |
 | `token_file` | `JIRA_API_TOKEN_FILE` | Default `~/.jiratoken` |
@@ -83,6 +83,10 @@ Checked inside the client before every mutating request, so no tool can widen it
 - `read-write`: everything.
 
 ## Library
+
+`ujira = { git = "https://github.com/wseaton/ujira", default-features = false }` builds only the
+client, typed models, and renderers, without the MCP server, CLI, or keychain dependencies (features
+`mcp`, `cli`, `keychain`; `cli` is the default and implies the other two).
 
 ```rust
 use ujira::{Access, Config, JiraClient, fields::field_text};
