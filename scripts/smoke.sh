@@ -9,17 +9,17 @@ set -euo pipefail
 
 TOOL="${1:?usage: smoke.sh <tool> [json-args]}"
 ARGS="${2:-{\}}"
-BIN="${JIRA_MCP_BIN:-$(dirname "$0")/../target/debug/jira-mcp}"
+BIN="${UJIRA_BIN:-$(dirname "$0")/../target/debug/ujira}"
 
-[ -x "$BIN" ] || { echo "no binary at $BIN (cargo build first, or set JIRA_MCP_BIN)" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "no binary at $BIN (cargo build first, or set UJIRA_BIN)" >&2; exit 1; }
 
 {
   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
   echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$TOOL\",\"arguments\":$ARGS}}"
   # The server has no idea we're done; give the call time to land, then close the pipe.
-  sleep "${JIRA_MCP_SMOKE_WAIT:-15}"
-} | "$BIN" 2>/dev/null | python3 -c '
+  sleep "${UJIRA_SMOKE_WAIT:-15}"
+} | "$BIN" mcp serve 2>/dev/null | python3 -c '
 import sys, json
 for line in sys.stdin:
     line = line.strip()
