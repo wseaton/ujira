@@ -479,26 +479,37 @@ impl JiraClient {
     /// Incremental label add: appends without replacing the existing set.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn add_labels(&self, key: &str, labels: &[String]) -> Result<()> {
-        self.require(Access::ReadWrite)?;
-        let ops: Vec<Value> = labels.iter().map(|l| json!({"add": l})).collect();
-        self.send(
-            self.req(reqwest::Method::PUT, &format!("/rest/api/2/issue/{key}"))
-                .json(&json!({"update": {"labels": ops}})),
-            "add_labels",
-        )
-        .await?;
-        Ok(())
+        self.put_labels(key, labels, &[], "add_labels").await
     }
 
     /// Incremental label remove: drops specific labels without touching the rest.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn remove_labels(&self, key: &str, labels: &[String]) -> Result<()> {
+        self.put_labels(key, &[], labels, "remove_labels").await
+    }
+
+    /// Add and remove labels in one request, so the issue never shows a half-applied edit.
+    /// Leaves the other labels alone. Sends nothing when both lists are empty.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn edit_labels(&self, key: &str, add: &[String], remove: &[String]) -> Result<()> {
+        self.put_labels(key, add, remove, "edit_labels").await
+    }
+
+    async fn put_labels(
+        &self,
+        key: &str,
+        add: &[String],
+        remove: &[String],
+        what: &str,
+    ) -> Result<()> {
         self.require(Access::ReadWrite)?;
-        let ops: Vec<Value> = labels.iter().map(|l| json!({"remove": l})).collect();
+        let Some(body) = labels_update(add, remove) else {
+            return Ok(());
+        };
         self.send(
             self.req(reqwest::Method::PUT, &format!("/rest/api/2/issue/{key}"))
-                .json(&json!({"update": {"labels": ops}})),
-            "remove_labels",
+                .json(&body),
+            what,
         )
         .await?;
         Ok(())
@@ -819,6 +830,20 @@ fn count_of(body: &Value) -> Result<u64> {
     })
 }
 
+/// An issue PUT body applying `update.labels` add and remove operations, or `None` when there
+/// is nothing to do.
+fn labels_update(add: &[String], remove: &[String]) -> Option<Value> {
+    if add.is_empty() && remove.is_empty() {
+        return None;
+    }
+    let ops: Vec<Value> = add
+        .iter()
+        .map(|l| json!({ "add": l }))
+        .chain(remove.iter().map(|l| json!({ "remove": l })))
+        .collect();
+    Some(json!({ "update": { "labels": ops } }))
+}
+
 fn issue_link_body(link_type: &str, source: &str, target: &str) -> Value {
     json!({
         "type": {"name": link_type},
@@ -1064,5 +1089,28 @@ mod tests {
             let err = count_of(&bad).unwrap_err().to_string();
             assert!(err.contains("has no count"), "{bad}: {err}");
         }
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn labels_update_puts_adds_and_removes_in_one_body() {
+        assert_eq!(labels_update(&[], &[]), None);
+        assert_eq!(
+            labels_update(&strings(&["a", "b"]), &[]),
+            Some(json!({"update": {"labels": [{"add": "a"}, {"add": "b"}]}}))
+        );
+        assert_eq!(
+            labels_update(&[], &strings(&["c"])),
+            Some(json!({"update": {"labels": [{"remove": "c"}]}}))
+        );
+        assert_eq!(
+            labels_update(&strings(&["new"]), &strings(&["old", "stale"])),
+            Some(json!({"update": {"labels": [
+                {"add": "new"}, {"remove": "old"}, {"remove": "stale"},
+            ]}}))
+        );
     }
 }
