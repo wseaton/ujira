@@ -41,6 +41,7 @@ pub mod client;
 pub mod config;
 pub mod fields;
 pub mod keychain;
+pub mod model;
 pub mod ops;
 mod paging;
 pub mod render;

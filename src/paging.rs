@@ -79,6 +79,69 @@ impl SearchPages {
     }
 }
 
+/// Offset-paging state for `startAt`/`maxResults` endpoints (changelog, comments): which offset
+/// to ask for next, and the items collected so far.
+pub(crate) struct OffsetPages {
+    items_key: &'static str,
+    items: Vec<Value>,
+    start_at: u64,
+    done: bool,
+}
+
+impl OffsetPages {
+    /// `items_key` names the array each page carries (`values`, `comments`).
+    pub(crate) fn new(items_key: &'static str) -> Self {
+        Self {
+            items_key,
+            items: Vec::new(),
+            start_at: 0,
+            done: false,
+        }
+    }
+
+    /// The `startAt` of the next page, or `None` once the last page has been taken.
+    pub(crate) fn next_start(&self) -> Option<u64> {
+        (!self.done).then_some(self.start_at)
+    }
+
+    /// Take one page. The end is `isLast` when the page carries it, else `startAt + items >= total`.
+    pub(crate) fn accept(&mut self, page: Value) -> Result<()> {
+        let key = self.items_key;
+        let Some(items) = page.get(key).and_then(Value::as_array) else {
+            bail!("jira page has no {key} array");
+        };
+        if let Some(start) = page.get("startAt")
+            && start.as_u64() != Some(self.start_at)
+        {
+            bail!("jira page starts at {start}, expected {}", self.start_at);
+        }
+        let count = items.len();
+        self.items.extend(items.iter().cloned());
+        let next = self.start_at + count as u64;
+        let last = match (
+            page.get("isLast").and_then(Value::as_bool),
+            page.get("total").and_then(Value::as_u64),
+        ) {
+            (Some(is_last), _) => is_last,
+            (None, Some(total)) => next >= total,
+            (None, None) => bail!("jira page carries neither isLast nor total"),
+        };
+        if !last && count == 0 {
+            bail!(
+                "jira returned an empty {key} page at {} that is not the last",
+                self.start_at
+            );
+        }
+        self.start_at = next;
+        self.done = last;
+        Ok(())
+    }
+
+    pub(crate) fn into_items(self) -> Vec<Value> {
+        self.items
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::paging::*;
@@ -226,5 +289,122 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-object issue at index 1"), "{err}");
+    }
+
+    fn values(range: std::ops::Range<u64>) -> Vec<Value> {
+        range.map(|n| json!({"id": n.to_string()})).collect()
+    }
+
+    #[test]
+    fn offset_pages_walks_until_is_last() {
+        let mut p = OffsetPages::new("values");
+        assert_eq!(p.next_start(), Some(0));
+        p.accept(json!({"startAt": 0, "total": 150, "isLast": false, "values": values(0..100)}))
+            .unwrap();
+        assert_eq!(p.next_start(), Some(100));
+        p.accept(json!({"startAt": 100, "total": 150, "isLast": true, "values": values(100..150)}))
+            .unwrap();
+        assert_eq!(p.next_start(), None);
+        let items = p.into_items();
+        assert_eq!(items.len(), 150);
+        assert_eq!(items[149]["id"], "149");
+    }
+
+    #[test]
+    fn offset_pages_falls_back_to_total_without_is_last() {
+        let mut p = OffsetPages::new("comments");
+        p.accept(json!({"startAt": 0, "maxResults": 2, "total": 3, "comments": values(0..2)}))
+            .unwrap();
+        assert_eq!(p.next_start(), Some(2));
+        p.accept(json!({"startAt": 2, "maxResults": 2, "total": 3, "comments": values(2..3)}))
+            .unwrap();
+        assert_eq!(p.next_start(), None);
+        assert_eq!(p.into_items().len(), 3);
+    }
+
+    #[test]
+    fn offset_pages_prefers_is_last_over_total() {
+        let mut p = OffsetPages::new("values");
+        p.accept(json!({"startAt": 0, "total": 2, "isLast": false, "values": values(0..2)}))
+            .unwrap();
+        assert_eq!(p.next_start(), Some(2));
+        p.accept(json!({"startAt": 2, "total": 4, "isLast": true, "values": values(2..4)}))
+            .unwrap();
+        assert_eq!(p.next_start(), None);
+    }
+
+    #[test]
+    fn offset_pages_accepts_an_empty_result() {
+        for page in [
+            json!({"startAt": 0, "total": 0, "values": []}),
+            json!({"startAt": 0, "isLast": true, "values": []}),
+        ] {
+            let mut p = OffsetPages::new("values");
+            p.accept(page).unwrap();
+            assert_eq!(p.next_start(), None);
+            assert!(p.into_items().is_empty());
+        }
+    }
+
+    #[test]
+    fn offset_pages_accepts_a_page_without_start_at() {
+        let mut p = OffsetPages::new("values");
+        p.accept(json!({"isLast": true, "values": values(0..1)}))
+            .unwrap();
+        assert_eq!(p.into_items().len(), 1);
+    }
+
+    #[test]
+    fn offset_pages_fails_on_an_empty_page_that_is_not_last() {
+        let mut p = OffsetPages::new("values");
+        let err = p
+            .accept(json!({"startAt": 0, "total": 5, "values": []}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty values page at 0"), "{err}");
+        let mut p = OffsetPages::new("values");
+        let err = p
+            .accept(json!({"startAt": 0, "isLast": false, "values": []}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not the last"), "{err}");
+    }
+
+    #[test]
+    fn offset_pages_fails_when_the_page_starts_elsewhere() {
+        for start in [json!(0), json!(5), json!("2"), Value::Null] {
+            let mut q = OffsetPages::new("values");
+            q.accept(json!({"startAt": 0, "isLast": false, "values": values(0..2)}))
+                .unwrap();
+            let err = q
+                .accept(json!({"startAt": start, "isLast": true, "values": values(2..3)}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("expected 2"), "{start}: {err}");
+        }
+    }
+
+    #[test]
+    fn offset_pages_fails_without_an_end_marker() {
+        let mut p = OffsetPages::new("values");
+        let err = p
+            .accept(json!({"startAt": 0, "values": values(0..1)}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("neither isLast nor total"), "{err}");
+    }
+
+    #[test]
+    fn offset_pages_fails_when_items_are_missing() {
+        for page in [
+            json!({"isLast": true}),
+            json!({"isLast": true, "values": {}}),
+            json!({"isLast": true, "comments": []}),
+            Value::Null,
+        ] {
+            let mut p = OffsetPages::new("values");
+            let err = p.accept(page.clone()).unwrap_err().to_string();
+            assert!(err.contains("no values array"), "{page}: {err}");
+        }
     }
 }

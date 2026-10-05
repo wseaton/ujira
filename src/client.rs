@@ -11,7 +11,8 @@
 
 use crate::config::{Access, Config};
 use crate::fields::{FieldIndex, values_by_name};
-use crate::paging::SearchPages;
+use crate::model::{ChangelogEntry, parse_items};
+use crate::paging::{OffsetPages, SearchPages};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
@@ -22,6 +23,9 @@ pub struct JiraClient {
     http: reqwest::Client,
     field_index: OnceLock<FieldIndex>,
 }
+
+/// The page size asked of offset-paged endpoints (Jira caps changelog and comments at 100).
+const OFFSET_PAGE_SIZE: u32 = 100;
 
 /// The compact fields a search row carries (enough to triage; `get_issue` for detail).
 const SEARCH_FIELDS: &[&str] = &["summary", "status", "issuetype", "labels", "assignee"];
@@ -137,6 +141,20 @@ impl JiraClient {
         };
         self.send(self.req(reqwest::Method::GET, &path), "get_issue")
             .await
+    }
+
+    /// Every changelog history of an issue, oldest first, across all pages.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn changelog(&self, key: &str) -> Result<Vec<ChangelogEntry>> {
+        let items = self
+            .offset_paged(
+                &["rest", "api", "3", "issue", key, "changelog"],
+                &[],
+                "values",
+                "changelog",
+            )
+            .await?;
+        parse_items("changelog", items)
     }
 
     /// The newest `limit` comments on an issue.
@@ -495,6 +513,32 @@ impl JiraClient {
             )
             .await?;
         Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// GET every page of a `startAt`/`maxResults` endpoint and return the raw items.
+    async fn offset_paged(
+        &self,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        items_key: &'static str,
+        what: &str,
+    ) -> Result<Vec<Value>> {
+        let mut pages = OffsetPages::new(items_key);
+        while let Some(start) = pages.next_start() {
+            let page = self
+                .send(
+                    self.req_segments(reqwest::Method::GET, segments)?
+                        .query(query)
+                        .query(&[
+                            ("startAt", start.to_string()),
+                            ("maxResults", OFFSET_PAGE_SIZE.to_string()),
+                        ]),
+                    what,
+                )
+                .await?;
+            pages.accept(page)?;
+        }
+        Ok(pages.into_items())
     }
 
     /// Send, then map a non-2xx to an error carrying the (truncated) body. A 204/empty body becomes
