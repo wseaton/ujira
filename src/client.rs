@@ -430,6 +430,7 @@ impl JiraClient {
     /// value (`null` when the issue has no value). Names resolve against `/rest/api/3/field`,
     /// fetched once per client. A name that matches no field, or more than one, fails the whole
     /// call with a [`crate::fields::FieldResolutionError`] listing every such name.
+    /// [`crate::fields::field_text`] reduces each value to its display text.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn get_fields_by_name(
         &self,
