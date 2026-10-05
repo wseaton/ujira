@@ -39,6 +39,7 @@
 pub mod adf;
 pub mod client;
 pub mod config;
+pub mod fields;
 pub mod keychain;
 pub mod ops;
 pub mod render;
