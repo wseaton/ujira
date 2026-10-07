@@ -26,6 +26,24 @@ claude mcp add --scope user jira -- ~/.cargo/bin/ujira mcp serve
 { "mcpServers": { "jira": { "command": "/abs/path/to/ujira", "args": ["mcp", "serve"] } } }
 ```
 
+### Running under crucible
+
+`ujira mcp serve` speaks crucible's `[mcp]` server contract. With `MCP_BIND` (`--bind`) set it
+serves streamable HTTP at `/mcp` instead of stdio, and requires `MCP_TOKENS_FILE`
+(`--tokens-file`): every request needs a bearer token listed in that file, which is re-read per
+request. `MCP_TOOLS` (`--tools`, comma-separated, either mode) limits which tools are listed and
+callable; an unknown name fails startup. `--allowed-host` (`MCP_ALLOWED_HOSTS`) adds `Host` values
+beyond loopback and the sandbox gateway names.
+
+```toml
+[mcp.ujira]
+bin = "ujira"
+args = ["mcp", "serve"]
+tools = ["jira_search", "jira_get_issue", "jira_get_comments"]
+env = { UJIRA_ACCESS = "read-only", JIRA_URL = "https://redhat.atlassian.net" }
+inherit = ["JIRA_API_TOKEN", "JIRA_EMAIL"]
+```
+
 ## Configure
 
 Env vars beat the config file, which beats the compiled-in defaults
@@ -86,7 +104,7 @@ Checked inside the client before every mutating request, so no tool can widen it
 
 `ujira = { git = "https://github.com/wseaton/ujira", default-features = false }` builds only the
 client, typed models, and renderers, without the MCP server, CLI, or keychain dependencies (features
-`mcp`, `cli`, `keychain`; `cli` is the default and implies the other two).
+`mcp`, `http`, `cli`, `keychain`; `cli` is the default and implies the other three).
 
 ```rust
 use ujira::{Access, Config, JiraClient, fields::field_text};

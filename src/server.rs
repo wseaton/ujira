@@ -12,6 +12,8 @@ use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// How much prose one description or comment may contribute before it's cut.
@@ -243,6 +245,47 @@ pub struct ComponentsArgs {
     pub format: String,
 }
 
+/// The tools a server exposes: a comma-separated list of tool names, each one this server carries.
+/// Tools outside the selection are neither listed nor callable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSelection(BTreeSet<String>);
+
+impl ToolSelection {
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+}
+
+impl FromStr for ToolSelection {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> anyhow::Result<Self> {
+        let known = tool_names(&JiraMcp::tool_router());
+        let mut picked = BTreeSet::new();
+        for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if !known.contains(name) {
+                anyhow::bail!(
+                    "unknown tool {name:?}; ujira serves {}",
+                    known.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
+            picked.insert(name.to_string());
+        }
+        if picked.is_empty() {
+            anyhow::bail!("the tool selection names no tools");
+        }
+        Ok(Self(picked))
+    }
+}
+
+fn tool_names(router: &ToolRouter<JiraMcp>) -> BTreeSet<String> {
+    router
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.into_owned())
+        .collect()
+}
+
 /// The MCP server. One shared [`JiraClient`]; every tool is a thin call + render.
 #[derive(Clone)]
 pub struct JiraMcp {
@@ -257,6 +300,16 @@ impl JiraMcp {
             jira,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Drop every tool outside `tools`, from the listing and from dispatch.
+    pub fn select(mut self, tools: &ToolSelection) -> Self {
+        for name in tool_names(&self.tool_router) {
+            if !tools.contains(&name) {
+                self.tool_router.remove_route(&name);
+            }
+        }
+        self
     }
 
     #[tool(
@@ -505,8 +558,11 @@ impl ServerHandler for JiraMcp {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::client::JiraClient;
     use crate::config::Config;
+    use crate::server::{JiraMcp, LinkArgs, ToolSelection};
+    use rmcp::ServerHandler;
+    use std::sync::Arc;
 
     fn server() -> JiraMcp {
         JiraMcp::new(Arc::new(JiraClient::new(Config {
@@ -569,5 +625,36 @@ mod tests {
         .expect("legacy link arguments");
         assert_eq!(legacy.source_key.as_deref(), Some("PROJ-1"));
         assert_eq!(legacy.target_key.as_deref(), Some("PROJ-2"));
+    }
+
+    #[test]
+    fn a_tool_selection_names_only_known_tools() {
+        let picked: ToolSelection = " jira_search,jira_get_issue,,jira_search ".parse().unwrap();
+        assert!(picked.contains("jira_search"));
+        assert!(picked.contains("jira_get_issue"));
+        assert!(!picked.contains("jira_create_issue"));
+        let err = "jira_search,jira_nope"
+            .parse::<ToolSelection>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"jira_nope\""), "{err}");
+        assert!(err.contains("jira_get_comments"), "{err}");
+        for empty in ["", " , "] {
+            assert!(empty.parse::<ToolSelection>().is_err(), "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn select_drops_unselected_tools_from_the_router() {
+        let picked: ToolSelection = "jira_search,jira_markdown_to_adf".parse().unwrap();
+        let mut names: Vec<_> = server()
+            .select(&picked)
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["jira_markdown_to_adf", "jira_search"]);
     }
 }

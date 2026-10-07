@@ -4,16 +4,20 @@
 //! together cost tens of thousands of context tokens before you've read a single ticket. This one
 //! carries sixteen tools and renders compact text (see [`ujira::render`]).
 //!
-//! `ujira mcp serve` serves MCP over stdio, which is how a client launches it. Every other subcommand
+//! `ujira mcp serve` serves MCP over stdio, which is how a client launches it, or over streamable
+//! HTTP behind bearer tokens when given `--bind` and `--tokens-file`. Every other subcommand
 //! is the same operation an MCP tool exposes, over the same [`ujira::ops`] code, printing the same
 //! bytes — so an agent can pipe, grep, and loop over `ujira` in a shell script instead of making
 //! one tool call per issue, and get exactly what the tool would have returned.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
+use std::path::PathBuf;
 use std::sync::Arc;
+use ujira::http::TokensFile;
+use ujira::server::ToolSelection;
 use ujira::{Config, JiraClient, JiraMcp, ops, ops::IssueFields};
 
 /// A token-frugal JIRA Cloud client: an MCP server, and the same tools as a CLI.
@@ -227,8 +231,29 @@ enum Command {
 
 #[derive(Subcommand)]
 enum McpCommand {
-    /// Serve MCP over stdio.
-    Serve,
+    /// Serve MCP over stdio, or over streamable HTTP at `/mcp` when --bind is set.
+    Serve(ServeArgs),
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Serve streamable HTTP on this host:port instead of stdio. Requires --tokens-file.
+    #[arg(long, env = "MCP_BIND", requires = "tokens_file")]
+    bind: Option<String>,
+    /// File of `<token> <sandbox> [<workdir>]` lines, re-read on every request; a request's bearer
+    /// token must match one.
+    #[arg(long, env = "MCP_TOKENS_FILE")]
+    tokens_file: Option<PathBuf>,
+    /// Comma-separated tool names to serve; the rest are neither listed nor callable.
+    #[arg(long, env = "MCP_TOOLS")]
+    tools: Option<ToolSelection>,
+    /// Host header values accepted over HTTP besides loopback and the sandbox gateway names.
+    #[arg(
+        long = "allowed-host",
+        env = "MCP_ALLOWED_HOSTS",
+        value_delimiter = ','
+    )]
+    allowed_hosts: Vec<String>,
 }
 
 #[tokio::main]
@@ -262,7 +287,7 @@ async fn main() -> Result<()> {
     let jira = Arc::new(JiraClient::new(Config::load()?));
 
     let out = match cli.command {
-        Command::Mcp(McpCommand::Serve) => return serve(jira).await,
+        Command::Mcp(McpCommand::Serve(args)) => return serve(jira, args).await,
         Command::Check => return check(&jira).await,
         Command::Search { jql, limit, json } => ops::search(&jira, &jql, limit, json).await?,
         Command::Issue {
@@ -375,14 +400,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn serve(jira: Arc<JiraClient>) -> Result<()> {
-    tracing::info!(site = %jira.config().base, "serving MCP over stdio");
-    let service = JiraMcp::new(jira)
-        .serve(stdio())
-        .await
-        .context("starting the MCP stdio service")?;
-    service.waiting().await.context("serving MCP over stdio")?;
-    Ok(())
+async fn serve(jira: Arc<JiraClient>, args: ServeArgs) -> Result<()> {
+    let site = jira.config().base.clone();
+    let mut server = JiraMcp::new(jira);
+    if let Some(tools) = &args.tools {
+        server = server.select(tools);
+    }
+    match (args.bind, args.tokens_file) {
+        (None, _) => {
+            tracing::info!(%site, "serving MCP over stdio");
+            let service = server
+                .serve(stdio())
+                .await
+                .context("starting the MCP stdio service")?;
+            service.waiting().await.context("serving MCP over stdio")?;
+            Ok(())
+        }
+        (Some(bind), Some(tokens)) => {
+            tracing::info!(%site, "serving MCP over HTTP");
+            ujira::http::serve(server, &bind, TokensFile::new(tokens), &args.allowed_hosts).await
+        }
+        (Some(_), None) => bail!("--bind (MCP_BIND) needs --tokens-file (MCP_TOKENS_FILE)"),
+    }
 }
 
 /// Opt-in only: with neither `UJIRA_LOG` nor `RUST_LOG` set, no subscriber is installed and the

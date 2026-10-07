@@ -32,8 +32,9 @@
 //!
 //! | Feature | Default | Adds |
 //! | --- | --- | --- |
-//! | `cli` | yes | the `ujira` binary; implies `mcp` and `keychain` (clap, tokio, tracing-subscriber) |
+//! | `cli` | yes | the `ujira` binary; implies `mcp`, `http`, and `keychain` (clap, tokio, tracing-subscriber) |
 //! | `mcp` | via `cli` | `server` and `JiraMcp`, the MCP tool surface (rmcp) |
+//! | `http` | via `cli` | `http`, the tool surface over streamable HTTP behind bearer tokens (axum, tokio) |
 //! | `keychain` | via `cli` | `keychain`, and the OS credential store as a token source (keyring) |
 //!
 //! `ujira = { version = "…", default-features = false }` builds the client, `model`, `fields`,
@@ -51,6 +52,8 @@ pub mod adf;
 pub mod client;
 pub mod config;
 pub mod fields;
+#[cfg(feature = "http")]
+pub mod http;
 #[cfg(feature = "keychain")]
 pub mod keychain;
 pub mod model;
