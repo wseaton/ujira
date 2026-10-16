@@ -45,25 +45,10 @@ pub fn markdown_to_adf(markdown: &str) -> Value {
             continue;
         }
 
-        if is_bullet_start(line) {
-            let mut items = Vec::new();
-            while i < lines.len() && is_bullet_start(lines[i]) {
-                let text = strip_bullet(lines[i]);
-                items.push(parse_inline(&text));
-                i += 1;
-            }
-            content.push(adf_bullet_list(&items));
-            continue;
-        }
-
-        if is_ordered_start(line) {
-            let mut items = Vec::new();
-            while i < lines.len() && is_ordered_start(lines[i]) {
-                let text = strip_ordered(lines[i]);
-                items.push(parse_inline(&text));
-                i += 1;
-            }
-            content.push(adf_ordered_list(&items));
+        if let Some(marker) = parse_list_marker(line)
+            && marker.indent <= MAX_BLOCK_INDENT
+        {
+            content.push(parse_list(&lines, &mut i, marker.indent, marker.kind));
             continue;
         }
 
@@ -136,8 +121,7 @@ pub fn markdown_to_adf(markdown: &str) -> Value {
             && !lines[i].trim().is_empty()
             && !lines[i].starts_with('#')
             && !lines[i].starts_with("```")
-            && !is_bullet_start(lines[i])
-            && !is_ordered_start(lines[i])
+            && !is_top_level_list_start(lines[i])
             && !is_horizontal_rule(lines[i])
             && !(lines[i].starts_with('|') && lines[i].ends_with('|'))
         {
@@ -188,23 +172,122 @@ fn is_horizontal_rule(line: &str) -> bool {
     trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-')
 }
 
-fn is_bullet_start(line: &str) -> bool {
-    line.starts_with("- ") || line.starts_with("* ")
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListKind {
+    Bullet,
+    Ordered,
 }
 
-fn strip_bullet(line: &str) -> String {
-    line[2..].to_string()
+// CommonMark permits up to three leading spaces before a block-level list marker.
+const MAX_BLOCK_INDENT: usize = 3;
+
+struct ListMarker<'a> {
+    kind: ListKind,
+    indent: usize,
+    content_indent: usize,
+    text: &'a str,
 }
 
-/// `1. text` — the space after the dot matters, or `1.5 stars` becomes a list.
-fn is_ordered_start(line: &str) -> bool {
-    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
-    digits > 0 && line[digits..].starts_with(". ")
+/// Parse a bullet or ordered-list marker and retain the indentation required by
+/// continuation lines. The space after an ordered marker matters, or text such
+/// as `1.5 stars` would become a list.
+fn parse_list_marker(line: &str) -> Option<ListMarker<'_>> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    let rest = &line[indent..];
+
+    if let Some(text) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+        return Some(ListMarker {
+            kind: ListKind::Bullet,
+            indent,
+            content_indent: indent + 2,
+            text,
+        });
+    }
+
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && rest[digits..].starts_with(". ") {
+        return Some(ListMarker {
+            kind: ListKind::Ordered,
+            indent,
+            content_indent: indent + digits + 2,
+            text: &rest[digits + 2..],
+        });
+    }
+
+    None
 }
 
-fn strip_ordered(line: &str) -> String {
-    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
-    line[digits + 2..].to_string()
+fn is_top_level_list_start(line: &str) -> bool {
+    parse_list_marker(line).is_some_and(|marker| marker.indent <= MAX_BLOCK_INDENT)
+}
+
+fn parse_list(lines: &[&str], i: &mut usize, indent: usize, kind: ListKind) -> Value {
+    let mut items = Vec::new();
+
+    while *i < lines.len() {
+        let Some(marker) = parse_list_marker(lines[*i]) else {
+            break;
+        };
+        if marker.indent != indent || marker.kind != kind {
+            break;
+        }
+
+        let content_indent = marker.content_indent;
+        let mut item_content = Vec::new();
+        let mut paragraph_lines = vec![marker.text];
+        *i += 1;
+
+        while *i < lines.len() {
+            let line = lines[*i];
+            if line.trim().is_empty() {
+                break;
+            }
+
+            if let Some(next_marker) = parse_list_marker(line) {
+                // Leave markers before the content column unconsumed: the outer loop owns
+                // a same-level sibling, while the caller owns an enclosing-level marker.
+                if next_marker.indent < content_indent {
+                    break;
+                }
+
+                // A marker at or beyond this item's content column starts a nested list.
+                push_list_paragraph(&mut item_content, &mut paragraph_lines);
+                item_content.push(parse_list(
+                    lines,
+                    i,
+                    next_marker.indent,
+                    next_marker.kind,
+                ));
+                continue;
+            }
+
+            let continuation_indent = line.bytes().take_while(|byte| *byte == b' ').count();
+            if continuation_indent < content_indent {
+                // This line lies outside the current item, so its caller must consume it.
+                break;
+            }
+
+            paragraph_lines.push(line[content_indent..].trim());
+            *i += 1;
+        }
+
+        push_list_paragraph(&mut item_content, &mut paragraph_lines);
+        items.push(json!({"type": "listItem", "content": item_content}));
+    }
+
+    let list_type = match kind {
+        ListKind::Bullet => "bulletList",
+        ListKind::Ordered => "orderedList",
+    };
+    json!({"type": list_type, "content": items})
+}
+
+fn push_list_paragraph(content: &mut Vec<Value>, lines: &mut Vec<&str>) {
+    if lines.is_empty() {
+        return;
+    }
+    content.push(adf_paragraph(&parse_inline(&lines.join(" "))));
+    lines.clear();
 }
 
 fn is_table_separator(line: &str) -> bool {
@@ -234,26 +317,6 @@ fn adf_code_block(text: &str, language: Option<&str>) -> Value {
         node["attrs"] = json!({"language": lang});
     }
     node
-}
-
-fn adf_bullet_list(items: &[Vec<Value>]) -> Value {
-    json!({
-        "type": "bulletList",
-        "content": items.iter().map(|nodes| json!({
-            "type": "listItem",
-            "content": [adf_paragraph(nodes)],
-        })).collect::<Vec<_>>(),
-    })
-}
-
-fn adf_ordered_list(items: &[Vec<Value>]) -> Value {
-    json!({
-        "type": "orderedList",
-        "content": items.iter().map(|nodes| json!({
-            "type": "listItem",
-            "content": [adf_paragraph(nodes)],
-        })).collect::<Vec<_>>(),
-    })
 }
 
 fn adf_table(rows: &[Vec<String>]) -> Value {
@@ -474,11 +537,67 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_bullet_continuation_stays_in_the_list_item() {
+        let adf = markdown_to_adf(concat!(
+            "* Reinstalling the platform for every test execution provides isolation but is\n",
+            "  slow, disruptive, and requires repeated privileged changes",
+        ));
+        let content = adf["content"].as_array().expect("document content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "bulletList");
+        assert_eq!(
+            content[0]["content"][0]["content"][0]["content"][0]["text"],
+            concat!(
+                "Reinstalling the platform for every test execution provides isolation but is ",
+                "slow, disruptive, and requires repeated privileged changes",
+            )
+        );
+    }
+
+    #[test]
     fn ordered_list() {
         let adf = markdown_to_adf("1. First\n2. Second\n3. Third");
         let ol = &adf["content"][0];
         assert_eq!(ol["type"], "orderedList");
         assert_eq!(ol["content"].as_array().map(|a| a.len()), Some(3));
+    }
+
+    #[test]
+    fn wrapped_ordered_list_continuation_uses_the_marker_width() {
+        let adf = markdown_to_adf(concat!(
+            "10. A two-digit marker\n",
+            "    has a four-space continuation\n",
+            "11. Next",
+        ));
+        let ol = &adf["content"][0];
+        assert_eq!(ol["type"], "orderedList");
+        assert_eq!(ol["content"].as_array().map(|items| items.len()), Some(2));
+        assert_eq!(
+            ol["content"][0]["content"][0]["content"][0]["text"],
+            "A two-digit marker has a four-space continuation"
+        );
+    }
+
+    #[test]
+    fn nested_list_is_not_flattened_into_wrapped_text() {
+        let adf = markdown_to_adf(concat!(
+            "* Parent\n",
+            "  * Child\n",
+            "    continued child text\n",
+            "* Sibling",
+        ));
+        let list = &adf["content"][0];
+        let first_item_content = list["content"][0]["content"]
+            .as_array()
+            .expect("first list item content");
+        assert_eq!(first_item_content.len(), 2);
+        assert_eq!(first_item_content[0]["type"], "paragraph");
+        assert_eq!(first_item_content[1]["type"], "bulletList");
+        assert_eq!(
+            first_item_content[1]["content"][0]["content"][0]["content"][0]["text"],
+            "Child continued child text"
+        );
+        assert_eq!(list["content"].as_array().map(|items| items.len()), Some(2));
     }
 
     #[test]
