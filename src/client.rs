@@ -22,6 +22,22 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// Whether an edit notifies the issue's watchers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notify {
+    Watchers,
+    Nobody,
+}
+
+impl Notify {
+    fn query_value(self) -> &'static str {
+        match self {
+            Notify::Watchers => "true",
+            Notify::Nobody => "false",
+        }
+    }
+}
+
 /// A connected JIRA Cloud client. Cheap to share behind an `Arc`.
 pub struct JiraClient {
     cfg: Config,
@@ -246,6 +262,7 @@ impl JiraClient {
         key: &str,
         comment_id: &str,
         body_adf: Value,
+        notify: Notify,
     ) -> Result<()> {
         self.require(Access::ReadWrite)?;
         self.send(
@@ -253,6 +270,7 @@ impl JiraClient {
                 reqwest::Method::PUT,
                 &["rest", "api", "3", "issue", key, "comment", comment_id],
             )?
+            .query(&[("notifyUsers", notify.query_value())])
             .json(&json!({ "body": body_adf })),
             "update_comment_adf",
         )
@@ -923,6 +941,12 @@ pub fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use crate::client::*;
+
+    #[test]
+    fn notify_maps_to_the_notify_users_query_value() {
+        assert_eq!(Notify::Watchers.query_value(), "true");
+        assert_eq!(Notify::Nobody.query_value(), "false");
+    }
 
     #[test]
     fn truncate_is_char_safe() {
